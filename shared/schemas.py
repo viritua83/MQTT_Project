@@ -23,13 +23,12 @@ from typing import List, Literal, TypedDict
 
 class StatePayload(TypedDict):
     phase: Literal["LOBBY", "WRITE", "DRAW", "GUESS", "REVEAL", "END"]
-    round: int                    # 0 pour LOBBY/WRITE, 1+ ensuite
-    total_rounds: int             # = nombre de joueurs
-    deadline_ts: int              # 0 si pas de deadline (LOBBY, REVEAL, END)
-    players_order: List[str]      # Ordre figé après START_GAME
+    round: int
+    total_rounds: int
+    deadline_ts: int
+    players_order: List[str]
     room_id: str
-    host: str                     # Pseudo du créateur de la room
-    version: int                  # Incrémenté à chaque publish
+    version: int
 
 
 # ---------------------------------------------------------------------------
@@ -44,11 +43,30 @@ class PresencePayload(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Server presence — publié par le serveur, même format que Presence mais
-# pour le serveur lui-même. Sur t_server_presence(room_id).
+# RoomsIndex — publié par le serveur sur t_rooms_index(), retained, QoS 1
+# Source de vérité pour le menu principal (liste des rooms disponibles).
 # ---------------------------------------------------------------------------
 
-# Réutilise PresencePayload (avec pseudo = "__server__" par convention).
+class RoomIndexEntry(TypedDict):
+    id: str            # room_id généré par le client créateur (hex 6 chars)
+    name: str          # Nom affichage saisi par l'utilisateur
+    n_players: int     # Nombre de joueurs actuellement en ligne
+    phase: Literal["LOBBY", "WRITE", "DRAW", "GUESS", "REVEAL", "END"]
+
+
+class RoomsIndexPayload(TypedDict):
+    rooms: List[RoomIndexEntry]
+    version: int       # Incrémenté à chaque republication
+
+
+# ---------------------------------------------------------------------------
+# RoomsCreate — publié par le client sur t_rooms_create(), NON retained, QoS 0
+# Demande de création d'une nouvelle room. L'id est généré côté client.
+# ---------------------------------------------------------------------------
+
+class RoomsCreatePayload(TypedDict):
+    room_id: str       # Généré par le client : secrets.token_hex(3)
+    name: str          # Nom d'affichage saisi par l'utilisateur
 
 
 # ---------------------------------------------------------------------------

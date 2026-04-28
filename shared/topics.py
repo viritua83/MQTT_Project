@@ -13,26 +13,42 @@ Convention :
 
 # Préfixe namespacé exigé par le sujet du projet.
 # À adapter avec le numéro de groupe quand il sera fixé.
-PREFIX = "isen-2026-gN/gartic"
+PREFIX = "isen-2026-VTGC/gartic"
 
 
 # ---------------------------------------------------------------------------
 # Topics globaux (hors room)
 # ---------------------------------------------------------------------------
 
-def t_rooms_index(room_id: str) -> str:
-    """Existence d'une room. Retained, QoS 0.
+def t_rooms_index() -> str:
+    """Index global des rooms existantes. Retained, QoS 1.
 
-    Permet aux clients dans le menu principal de lister les parties
-    disponibles via une souscription sur sub_rooms_index().
+    Payload JSON unique listant toutes les rooms avec leurs métadonnées
+    (id, nom affiché, nb joueurs, phase). Maintenu par le serveur :
+    chaque création/suppression/changement de phase republie l'index complet.
     """
-    return f"{PREFIX}/rooms-index/{room_id}"
+    return f"{PREFIX}/rooms-index"
 
 
-def sub_rooms_index() -> str:
-    """Wildcard pour découvrir toutes les rooms existantes."""
-    return f"{PREFIX}/rooms-index/+"
+def t_rooms_create() -> str:
+    """Demande de création de room. NON retained, QoS 0.
 
+    Publié par un client qui veut créer une room. Le serveur écoute et
+    crée la room (sauf collision d'id, ignorée silencieusement).
+    QoS 0 car best-effort : si le message se perd, le client le verra
+    via son timeout (room non apparue dans l'index) et pourra retenter.
+    """
+    return f"{PREFIX}/rooms-create"
+
+
+def t_server_presence() -> str:
+    """Présence du serveur arbitre, GLOBALE. Retained, QoS 1, LWT.
+
+    Un seul serveur gère toutes les rooms, donc une seule LWT serveur.
+    Si le serveur crash, les clients de toutes les rooms le voient via
+    ce topic unique.
+    """
+    return f"{PREFIX}/server/presence"
 
 # ---------------------------------------------------------------------------
 # Topics propres à une room
@@ -59,14 +75,6 @@ def t_player_presence(room_id: str, pseudo: str) -> str:
 def sub_all_player_presence(room_id: str) -> str:
     """Wildcard pour observer la présence de tous les joueurs de la room."""
     return f"{PREFIX}/rooms/{room_id}/presence/+"
-
-
-def t_server_presence(room_id: str) -> str:
-    """Présence du serveur arbitre. Retained, QoS 1, LWT.
-
-    Si le serveur crash, les clients basculent en mode 'partie suspendue'.
-    """
-    return f"{PREFIX}/rooms/{room_id}/server/presence"
 
 
 def t_player_ready(room_id: str, pseudo: str) -> str:
