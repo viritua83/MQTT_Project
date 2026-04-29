@@ -1,3 +1,4 @@
+import time
 from shared.mqtt_client import GarticMqttClient
 from shared import topics
 
@@ -10,7 +11,7 @@ class NetworkManager:
     def connect(self):
         client_id = f"client-{self.state.pseudo}-{self.state.room_id}"
         will_topic = topics.t_player_presence(self.state.room_id, self.state.pseudo)
-        will_payload = {"status": "offline", "pseudo": self.state.pseudo}
+        will_payload = {"status": "offline", "pseudo": self.state.pseudo, "ts": int(time.time())}
 
         self.client = GarticMqttClient(
             client_id=client_id,
@@ -29,13 +30,11 @@ class NetworkManager:
         )
 
         self.client.on_ready(self._publish_online)
-
         self.client.connect_and_loop()
 
     def _publish_online(self):
         topic = topics.t_player_presence(self.state.room_id, self.state.pseudo)
-        self.client.publish_json(topic, {"status": "online", "pseudo": self.state.pseudo}, retain=True)
-        print(f"[*] Connecté et présence publiée sur {topic}")
+        self.client.publish_json(topic, {"status": "online", "pseudo": self.state.pseudo, "ts": int(time.time())}, retain=True)
 
     def _on_presence(self, topic, payload, retain):
         if not payload: return
@@ -47,14 +46,12 @@ class NetworkManager:
         elif status == "offline" and pseudo in self.state.players:
             self.state.players.remove(pseudo)
 
-        print(f"[Réseau] Joueurs en ligne : {self.state.players}")
-        self.app.after(0, self.app.current_screen.update_players_list)
+        if hasattr(self.app.current_screen, 'update_players_list'):
+            self.app.after(0, self.app.current_screen.update_players_list)
 
     def _on_state(self, topic, payload, retain):
         if not payload: return
         phase = payload.get("phase")
         if phase and phase != self.state.phase:
             self.state.phase = phase
-            print(f"[Réseau] Le serveur change la phase en : {phase}")
-            
             self.app.after(0, lambda: self.app.show_screen(phase))

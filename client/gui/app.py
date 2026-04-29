@@ -16,7 +16,6 @@ class GarticApp(tk.Tk):
         
         phases_to_test = ["LOGIN", "LOBBY", "WRITE", "DRAW", "GUESS", "REVEAL"]
         for phase in phases_to_test:
-            # L'astuce p=phase permet au bouton de se souvenir de son propre nom
             tk.Button(self.debug_bar, text=phase, bg="#555", fg="white",
                       command=lambda p=phase: self.show_screen(p)).pack(side="left", padx=5)
 

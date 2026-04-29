@@ -1,6 +1,7 @@
 import tkinter as tk
-from shared import topics
+import secrets
 import time
+from shared import topics
 
 class LoginScreen(tk.Frame):
     def __init__(self, parent, app):
@@ -8,30 +9,58 @@ class LoginScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="Bienvenue dans Gartic Paint", 
-                 font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=40)
+        tk.Label(self, text="Bienvenue dans Gartic MQTT", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
 
         tk.Label(self, text="Ton Pseudo :", font=("Arial", 14), fg="white", bg="#2C3E50").pack(pady=5)
         self.pseudo_entry = tk.Entry(self, font=("Arial", 14), justify="center")
         self.pseudo_entry.pack(pady=5)
 
-        tk.Label(self, text="Nom de la Salle :", font=("Arial", 14), fg="white", bg="#2C3E50").pack(pady=5)
-        self.room_entry = tk.Entry(self, font=("Arial", 14), justify="center")
-        self.room_entry.pack(pady=5)
+        create_frame = tk.LabelFrame(self, text="Créer une nouvelle salle", bg="#34495E", fg="white", font=("Arial", 12), padx=20, pady=10)
+        create_frame.pack(pady=15, fill="x", padx=100)
+        
+        tk.Label(create_frame, text="Nom de la salle :", bg="#34495E", fg="lightgray").pack(pady=5)
+        self.room_name_entry = tk.Entry(create_frame, font=("Arial", 14), justify="center")
+        self.room_name_entry.pack(pady=5)
+        
+        tk.Button(create_frame, text="Créer la salle", font=("Arial", 12, "bold"), bg="#2980B9", fg="white", command=self.create_room).pack(pady=10)
 
-        tk.Button(self, text="Rejoindre la partie", font=("Arial", 14, "bold"), 
-                  bg="#27AE60", fg="white", command=self.join_game).pack(pady=30)
+        join_frame = tk.LabelFrame(self, text="Rejoindre une salle", bg="#34495E", fg="white", font=("Arial", 12), padx=20, pady=10)
+        join_frame.pack(pady=10, fill="x", padx=100)
+        
+        tk.Label(join_frame, text="ID de la salle :", bg="#34495E", fg="lightgray").pack(pady=5)
+        self.room_id_entry = tk.Entry(join_frame, font=("Arial", 14), justify="center")
+        self.room_id_entry.pack(pady=5)
+        
+        tk.Button(join_frame, text="Rejoindre", font=("Arial", 12, "bold"), bg="#27AE60", fg="white", command=self.join_room).pack(pady=10)
 
-    def join_game(self):
+    def create_room(self):
         pseudo = self.pseudo_entry.get().strip()
-        room = self.room_entry.get().strip()
+        room_name = self.room_name_entry.get().strip()
 
-        if pseudo and room:
+        if pseudo and room_name:
+            room_id = secrets.token_hex(3)
             self.app.state.pseudo = pseudo
-            self.app.state.room_id = room
+            self.app.state.room_id = room_id
             
             self.app.net.connect()
             
+            payload = {
+                "room_id": room_id,
+                "name": room_name
+            }
+            self.app.net.client.publish_json(topics.t_rooms_create(), payload, qos=0)
+            
+            self.app.show_screen("LOBBY")
+
+    def join_room(self):
+        pseudo = self.pseudo_entry.get().strip()
+        room_id = self.room_id_entry.get().strip()
+
+        if pseudo and room_id:
+            self.app.state.pseudo = pseudo
+            self.app.state.room_id = room_id
+            
+            self.app.net.connect()
             self.app.show_screen("LOBBY")
 
 class LobbyScreen(tk.Frame):
@@ -40,18 +69,14 @@ class LobbyScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text=f"Lobby - Salle : {self.app.state.room_id}", 
-                 font=("Arial", 20, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
-        
-        tk.Label(self, text=f"Connecté : {self.app.state.pseudo}", 
-                 font=("Arial", 12), fg="lightgray", bg="#2C3E50").pack(pady=5)
+        tk.Label(self, text=f"Lobby - Salle : {self.app.state.room_id}", font=("Arial", 20, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
+        tk.Label(self, text="(Donne cet ID pour qu'on te rejoigne)", font=("Arial", 10, "italic"), fg="#F1C40F", bg="#2C3E50").pack(pady=0)
+        tk.Label(self, text=f"Connecté : {self.app.state.pseudo}", font=("Arial", 12), fg="lightgray", bg="#2C3E50").pack(pady=5)
 
-        self.players_label = tk.Label(self, text="Joueurs en ligne :\n- " + self.app.state.pseudo, 
-                                      font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
+        self.players_label = tk.Label(self, text="Joueurs en ligne :\n- " + self.app.state.pseudo, font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
         self.players_label.pack(pady=20)
 
-        self.ready_btn = tk.Button(self, text="Je suis prêt !", font=("Arial", 14, "bold"), 
-                                   bg="#E67E22", fg="white", command=self.toggle_ready)
+        self.ready_btn = tk.Button(self, text="Je suis prêt !", font=("Arial", 14, "bold"), bg="#E67E22", fg="white", command=self.toggle_ready)
         self.ready_btn.pack(pady=30)
 
     def toggle_ready(self):
@@ -71,7 +96,6 @@ class LobbyScreen(tk.Frame):
         self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
 
     def update_players_list(self):
-        """Cette fonction sera appelée par le réseau quand un joueur rejoint/quitte"""
         text = "Joueurs en ligne :\n"
         for p in self.app.state.players:
             text += f"- {p}\n"
@@ -83,18 +107,16 @@ class DrawScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="À toi de dessiner !", font=("Arial", 18, "bold"), 
-                 fg="white", bg="#2C3E50").pack(pady=10)
+        tk.Label(self, text="À toi de dessiner !", font=("Arial", 18, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
 
         self.toolbar = tk.Frame(self, bg="gray")
         self.toolbar.pack(side="top", fill="x", padx=20)
 
         self.current_color = "black"
+        self.current_width = 3
         self.colors = ["black", "red", "green", "blue", "yellow", "orange", "purple", "white"]
         
-        tk.Button(self.toolbar, text="Envoyer le dessin ✔", bg="#27AE60", fg="white", 
-                  font=("Arial", 10, "bold"), command=self.submit_drawing).pack(side="right", padx=10)
-
+        tk.Button(self.toolbar, text="Envoyer le dessin ✔", bg="#27AE60", fg="white", font=("Arial", 10, "bold"), command=self.submit_drawing).pack(side="right", padx=10)
         tk.Button(self.toolbar, text="Effacer", command=self.clear_canvas).pack(side="right", padx=5)
         tk.Button(self.toolbar, text="Redo ↪", command=self.redo).pack(side="right", padx=2)
         tk.Button(self.toolbar, text="Undo ↩", command=self.undo).pack(side="right", padx=2)
@@ -102,6 +124,11 @@ class DrawScreen(tk.Frame):
         for color in self.colors:
             btn = tk.Button(self.toolbar, bg=color, width=3, command=lambda c=color: self.set_color(c))
             btn.pack(side="left", padx=2, pady=2)
+
+        tk.Label(self.toolbar, text="  Épaisseur:", bg="gray", fg="white").pack(side="left")
+        tk.Button(self.toolbar, text="Fin", command=lambda: self.set_width(2)).pack(side="left", padx=2)
+        tk.Button(self.toolbar, text="Moyen", command=lambda: self.set_width(5)).pack(side="left", padx=2)
+        tk.Button(self.toolbar, text="Épais", command=lambda: self.set_width(10)).pack(side="left", padx=2)
 
         self.canvas = tk.Canvas(self, bg="white", width=600, height=400)
         self.canvas.pack(pady=10)
@@ -123,25 +150,25 @@ class DrawScreen(tk.Frame):
             "type": "drawing",
             "round": getattr(self.app.state, "round", 1),
             "author": self.app.state.pseudo,
-            "strokes": self.all_strokes
+            "strokes": self.all_strokes,
+            "canvas_size": [600, 400],
+            "ts": int(time.time())
         }
         
-        topic = topics.t_submission(
-            self.app.state.room_id, 
-            payload["round"], 
-            self.app.state.pseudo
-        )
+        topic = topics.t_submission(self.app.state.room_id, payload["round"], self.app.state.pseudo)
         
         self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
-        print(f"[*] Dessin envoyé sur {topic} ({len(self.all_strokes)} traits)")
         
         self.canvas.unbind("<Button-1>")
         self.canvas.unbind("<B1-Motion>")
         self.canvas.unbind("<ButtonRelease-1>")
-        tk.Label(self, text="Dessin envoyé ! En attente des autres...", 
-                 font=("Arial", 14), fg="#F1C40F", bg="#2C3E50").pack(pady=5)
+        tk.Label(self, text="Dessin envoyé ! En attente des autres...", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50").pack(pady=5)
 
-    def set_color(self, color): self.current_color = color
+    def set_color(self, color): 
+        self.current_color = color
+
+    def set_width(self, width):
+        self.current_width = width
     
     def clear_canvas(self):
         self.canvas.delete("all")
@@ -154,13 +181,16 @@ class DrawScreen(tk.Frame):
 
     def draw(self, event):
         if self.last_x and self.last_y:
-            self.canvas.create_line(self.last_x, self.last_y, event.x, event.y, 
-                                    fill=self.current_color, width=3, capstyle=tk.ROUND)
+            self.canvas.create_line(self.last_x, self.last_y, event.x, event.y, fill=self.current_color, width=self.current_width, capstyle=tk.ROUND)
             self.current_stroke_points.append((event.x, event.y))
             self.last_x, self.last_y = event.x, event.y
 
     def stop_draw(self, event):
-        stroke_data = {"color": self.current_color, "points": self.current_stroke_points}
+        stroke_data = {
+            "color": self.current_color,
+            "width": self.current_width,
+            "points": self.current_stroke_points
+        }
         self.all_strokes.append(stroke_data)
         self.redo_stack = [] 
         self.last_x, self.last_y = None, None
@@ -181,13 +211,11 @@ class DrawScreen(tk.Frame):
         for stroke in self.all_strokes:
             color = stroke["color"]
             points = stroke["points"]
+            width = stroke.get("width", 3)
             for i in range(len(points) - 1):
                 x1, y1 = points[i]
                 x2, y2 = points[i+1]
-                self.canvas.create_line(x1, y1, x2, y2, fill=color, width=3, capstyle=tk.ROUND)
-            
-
-
+                self.canvas.create_line(x1, y1, x2, y2, fill=color, width=width, capstyle=tk.ROUND)
 
 class WriteScreen(tk.Frame):
     def __init__(self, parent, app):
@@ -195,17 +223,13 @@ class WriteScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="Phase d'Écriture", font=("Arial", 24, "bold"), 
-                 fg="white", bg="#2C3E50").pack(pady=40)
-        
-        tk.Label(self, text="Invente une phrase drôle ou absurde :", 
-                 font=("Arial", 16), fg="lightgray", bg="#2C3E50").pack(pady=10)
+        tk.Label(self, text="Phase d'Écriture", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=40)
+        tk.Label(self, text="Invente une phrase drôle ou absurde :", font=("Arial", 16), fg="lightgray", bg="#2C3E50").pack(pady=10)
 
         self.sentence_entry = tk.Entry(self, font=("Arial", 16), width=40, justify="center")
         self.sentence_entry.pack(pady=20)
 
-        self.submit_btn = tk.Button(self, text="Envoyer la phrase ✔", font=("Arial", 14, "bold"), 
-                                    bg="#27AE60", fg="white", command=self.submit_sentence)
+        self.submit_btn = tk.Button(self, text="Envoyer la phrase ✔", font=("Arial", 14, "bold"), bg="#27AE60", fg="white", command=self.submit_sentence)
         self.submit_btn.pack(pady=20)
 
         self.status_label = tk.Label(self, text="", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50")
@@ -229,8 +253,6 @@ class WriteScreen(tk.Frame):
         if self.app.net.client:
             self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
             
-        print(f"[*] Phrase envoyée sur {topic} : '{content}'")
-
         self.sentence_entry.config(state="disabled")
         self.submit_btn.config(state="disabled")
         self.status_label.config(text="Phrase envoyée ! En attente des autres...")
@@ -241,22 +263,19 @@ class GuessScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="Que représente ce dessin ?", font=("Arial", 20, "bold"), 
-                 fg="white", bg="#2C3E50").pack(pady=10)
+        tk.Label(self, text="Que représente ce dessin ?", font=("Arial", 20, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
 
         self.canvas = tk.Canvas(self, bg="white", width=600, height=300)
         self.canvas.pack(pady=10)
         
-        self.canvas.create_text(300, 150, text="[Le dessin d'un autre joueur s'affichera ici]", 
-                                font=("Arial", 14), fill="gray")
+        self.canvas.create_text(300, 150, text="[Le dessin d'un autre joueur s'affichera ici]", font=("Arial", 14), fill="gray")
 
         tk.Label(self, text="Ta déduction :", font=("Arial", 14), fg="lightgray", bg="#2C3E50").pack(pady=5)
         
         self.guess_entry = tk.Entry(self, font=("Arial", 16), width=40, justify="center")
         self.guess_entry.pack(pady=10)
 
-        self.submit_btn = tk.Button(self, text="Envoyer la réponse ✔", font=("Arial", 14, "bold"), 
-                                    bg="#27AE60", fg="white", command=self.submit_guess)
+        self.submit_btn = tk.Button(self, text="Envoyer la réponse ✔", font=("Arial", 14, "bold"), bg="#27AE60", fg="white", command=self.submit_guess)
         self.submit_btn.pack(pady=10)
 
         self.status_label = tk.Label(self, text="", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50")
@@ -279,8 +298,6 @@ class GuessScreen(tk.Frame):
 
         if self.app.net.client:
             self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
-            
-        print(f"[*] Déduction envoyée sur {topic} : '{content}'")
 
         self.guess_entry.config(state="disabled")
         self.submit_btn.config(state="disabled")

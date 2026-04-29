@@ -12,4 +12,4 @@ class ClientState:
         self.total_rounds = 0
         self.deadline_ts = 0
         self.players_order = []
-        self.host = ""
+        self.version = 0
