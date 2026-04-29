@@ -1,4 +1,5 @@
 import tkinter as tk
+from tkinter import simpledialog
 import secrets
 import time
 from shared import topics
