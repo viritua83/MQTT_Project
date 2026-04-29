@@ -1,6 +1,8 @@
 import tkinter as tk
 from client.network import NetworkManager
-from .screens import LoginScreen, LobbyScreen, DrawScreen, WriteScreen, GuessScreen, RevealScreen 
+from .screens import MenuScreen, LobbyScreen, DrawScreen, WriteScreen, GuessScreen, RevealScreen 
+
+DEBUG_MODE = True
 
 class GarticApp(tk.Tk):
     def __init__(self, state):
@@ -9,28 +11,27 @@ class GarticApp(tk.Tk):
         self.net = NetworkManager(self)
         self.title("Gartic MQTT")
         
-        self.debug_bar = tk.Frame(self, bg="black", pady=5)
-        self.debug_bar.pack(side="bottom", fill="x")
-        
-        tk.Label(self.debug_bar, text="⚙️ DEBUG :", fg="yellow", bg="black", font=("Arial", 10, "bold")).pack(side="left", padx=10)
-        
-        phases_to_test = ["LOGIN", "LOBBY", "WRITE", "DRAW", "GUESS", "REVEAL"]
-        for phase in phases_to_test:
-            tk.Button(self.debug_bar, text=phase, bg="#555", fg="white",
-                      command=lambda p=phase: self.show_screen(p)).pack(side="left", padx=5)
+        if DEBUG_MODE:
+            self.debug_bar = tk.Frame(self, bg="black", pady=5)
+            self.debug_bar.pack(side="bottom", fill="x")
+            tk.Label(self.debug_bar, text="⚙️ DEBUG :", fg="yellow", bg="black", font=("Arial", 10, "bold")).pack(side="left", padx=10)
+            phases_to_test = ["MENU", "LOBBY", "WRITE", "DRAW", "GUESS", "REVEAL"]
+            for phase in phases_to_test:
+                tk.Button(self.debug_bar, text=phase, bg="#555", fg="white", command=lambda p=phase: self.show_screen(p)).pack(side="left", padx=5)
 
         self.container = tk.Frame(self)
         self.container.pack(side="top", fill="both", expand=True)
         
         self.current_screen = None
-        self.show_screen("LOGIN")
+        self.net.connect_menu()
+        self.show_screen("MENU")
 
     def show_screen(self, phase):
         if self.current_screen:
             self.current_screen.destroy()
             
-        if phase == "LOGIN":
-            self.current_screen = LoginScreen(self.container, self)
+        if phase == "MENU":
+            self.current_screen = MenuScreen(self.container, self)
         elif phase == "LOBBY":
             self.current_screen = LobbyScreen(self.container, self)
         elif phase == "WRITE":

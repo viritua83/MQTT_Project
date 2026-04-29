@@ -3,66 +3,83 @@ import secrets
 import time
 from shared import topics
 
-class LoginScreen(tk.Frame):
+class MenuScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="Bienvenue dans Gartic MQTT", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
+        tk.Label(self, text="Gartic MQTT", font=("Arial", 28, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
+
+        self.server_status_label = tk.Label(self, text="🔴 Serveur hors ligne", font=("Arial", 14, "bold"), fg="#E74C3C", bg="#2C3E50")
+        self.server_status_label.pack(pady=10)
 
         tk.Label(self, text="Ton Pseudo :", font=("Arial", 14), fg="white", bg="#2C3E50").pack(pady=5)
         self.pseudo_entry = tk.Entry(self, font=("Arial", 14), justify="center")
         self.pseudo_entry.pack(pady=5)
 
-        create_frame = tk.LabelFrame(self, text="Créer une nouvelle salle", bg="#34495E", fg="white", font=("Arial", 12), padx=20, pady=10)
-        create_frame.pack(pady=15, fill="x", padx=100)
-        
-        tk.Label(create_frame, text="Nom de la salle :", bg="#34495E", fg="lightgray").pack(pady=5)
-        self.room_name_entry = tk.Entry(create_frame, font=("Arial", 14), justify="center")
-        self.room_name_entry.pack(pady=5)
-        
-        tk.Button(create_frame, text="Créer la salle", font=("Arial", 12, "bold"), bg="#2980B9", fg="white", command=self.create_room).pack(pady=10)
+        self.rooms_frame = tk.LabelFrame(self, text="Salons disponibles", bg="#34495E", fg="white", font=("Arial", 12), padx=10, pady=10)
+        self.rooms_frame.pack(pady=20, fill="both", expand=True, padx=50)
 
-        join_frame = tk.LabelFrame(self, text="Rejoindre une salle", bg="#34495E", fg="white", font=("Arial", 12), padx=20, pady=10)
-        join_frame.pack(pady=10, fill="x", padx=100)
-        
-        tk.Label(join_frame, text="ID de la salle :", bg="#34495E", fg="lightgray").pack(pady=5)
-        self.room_id_entry = tk.Entry(join_frame, font=("Arial", 14), justify="center")
-        self.room_id_entry.pack(pady=5)
-        
-        tk.Button(join_frame, text="Rejoindre", font=("Arial", 12, "bold"), bg="#27AE60", fg="white", command=self.join_room).pack(pady=10)
+        self.rooms_list_inner = tk.Frame(self.rooms_frame, bg="#34495E")
+        self.rooms_list_inner.pack(fill="both", expand=True)
 
-    def create_room(self):
+        tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup).pack(pady=20)
+
+        self.update_server_status()
+        self.update_rooms_list()
+
+    def update_server_status(self):
+        if self.app.state.server_online:
+            self.server_status_label.config(text="🟢 Serveur en ligne", fg="#2ECC71")
+        else:
+            self.server_status_label.config(text="🔴 Serveur hors ligne", fg="#E74C3C")
+
+    def update_rooms_list(self):
+        for widget in self.rooms_list_inner.winfo_children():
+            widget.destroy()
+
+        if not self.app.state.available_rooms:
+            tk.Label(self.rooms_list_inner, text="Aucune salle disponible.", font=("Arial", 12, "italic"), fg="lightgray", bg="#34495E").pack(pady=20)
+            return
+
+        for room in self.app.state.available_rooms:
+            room_id = room.get("id")
+            name = room.get("name")
+            n_players = room.get("n_players")
+            phase = room.get("phase")
+
+            btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
+            
+            state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
+            bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
+
+            tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
+                      command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
+
+    def create_room_popup(self):
         pseudo = self.pseudo_entry.get().strip()
-        room_name = self.room_name_entry.get().strip()
+        if not pseudo:
+            return
 
-        if pseudo and room_name:
+        room_name = simpledialog.askstring("Nouvelle Salle", "Nom de la salle :", parent=self)
+        if room_name:
             room_id = secrets.token_hex(3)
-            self.app.state.pseudo = pseudo
-            self.app.state.room_id = room_id
+            payload = {"room_id": room_id, "name": room_name}
             
-            self.app.net.connect()
-            
-            payload = {
-                "room_id": room_id,
-                "name": room_name
-            }
             self.app.net.client.publish_json(topics.t_rooms_create(), payload, qos=0)
-            
+            self.app.net.enter_room(room_id, pseudo)
             self.app.show_screen("LOBBY")
 
-    def join_room(self):
+    def join_specific_room(self, room_id):
         pseudo = self.pseudo_entry.get().strip()
-        room_id = self.room_id_entry.get().strip()
-
-        if pseudo and room_id:
-            self.app.state.pseudo = pseudo
-            self.app.state.room_id = room_id
+        if not pseudo:
+            return
             
-            self.app.net.connect()
-            self.app.show_screen("LOBBY")
+        self.app.net.enter_room(room_id, pseudo)
+        self.app.show_screen("LOBBY")
 
+        
 class LobbyScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)

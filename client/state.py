@@ -13,3 +13,6 @@ class ClientState:
         self.deadline_ts = 0
         self.players_order = []
         self.version = 0
+
+        self.server_online = False
+        self.available_rooms = []
