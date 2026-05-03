@@ -25,7 +25,13 @@ class MenuScreen(tk.Frame):
         self.rooms_list_inner = tk.Frame(self.rooms_frame, bg="#34495E")
         self.rooms_list_inner.pack(fill="both", expand=True)
 
-        tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup).pack(pady=20)
+        self.create_btn = tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup)
+        self.create_btn.pack(pady=10)
+
+        self.status_label = tk.Label(self, text="", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50")
+        self.status_label.pack(pady=5)
+
+        self.pending_room_id = None
 
         self.update_server_status()
         self.update_rooms_list()
@@ -42,60 +48,87 @@ class MenuScreen(tk.Frame):
 
         if not self.app.state.available_rooms:
             tk.Label(self.rooms_list_inner, text="Aucune salle disponible.", font=("Arial", 12, "italic"), fg="lightgray", bg="#34495E").pack(pady=20)
-            return
+        else:
+            for room in self.app.state.available_rooms:
+                room_id = room.get("id")
+                name = room.get("name")
+                n_players = room.get("n_players")
+                phase = room.get("phase")
 
-        for room in self.app.state.available_rooms:
-            room_id = room.get("id")
-            name = room.get("name")
-            n_players = room.get("n_players")
-            phase = room.get("phase")
+                btn_text = f"{name} ({n_players} joueur(s)) - [{phase}]"
+                state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
+                bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
 
-            btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
-            
-            state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
-            bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
+                tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
+                          command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
 
-            tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
-                      command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
+        if self.pending_room_id:
+            if any(r.get("id") == self.pending_room_id for r in self.app.state.available_rooms):
+                room_id_to_join = self.pending_room_id
+                self.pending_room_id = None 
+                pseudo = self.pseudo_entry.get().strip()
+                self.app.net.enter_room(room_id_to_join, pseudo)
+                self.app.show_screen("LOBBY")
 
     def create_room_popup(self):
         pseudo = self.pseudo_entry.get().strip()
         if not pseudo:
+            self.status_label.config(text="⚠️ Choisis un pseudo d'abord !", fg="#E74C3C")
             return
 
         room_name = simpledialog.askstring("Nouvelle Salle", "Nom de la salle :", parent=self)
         if room_name:
-            room_id = secrets.token_hex(3)
-            payload = {"room_id": room_id, "name": room_name}
+            self.pending_room_id = secrets.token_hex(3)
+            payload = {"room_id": self.pending_room_id, "name": room_name}
+            
+            self.create_btn.config(state="disabled")
+            self.status_label.config(text=f"⏳ Création de '{room_name}' en cours...", fg="#F1C40F")
             
             self.app.net.client.publish_json(topics.t_rooms_create(), payload, qos=0)
-            self.app.net.enter_room(room_id, pseudo)
-            self.app.show_screen("LOBBY")
+            
+            self.app.after(3000, self.check_creation_timeout)
+
+    def check_creation_timeout(self):
+        if not self.winfo_exists():
+            return
+            
+        if self.pending_room_id:
+            self.status_label.config(text="❌ Échec de la création (Le serveur n'a pas répondu).", fg="#E74C3C")
+            self.pending_room_id = None
+            self.create_btn.config(state="normal")
 
     def join_specific_room(self, room_id):
         pseudo = self.pseudo_entry.get().strip()
         if not pseudo:
+            self.status_label.config(text="⚠️ Choisis un pseudo d'abord !", fg="#E74C3C")
             return
             
         self.app.net.enter_room(room_id, pseudo)
         self.app.show_screen("LOBBY")
 
-        
 class LobbyScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text=f"Lobby - Salle : {self.app.state.room_id}", font=("Arial", 20, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
-        tk.Label(self, text="(Donne cet ID pour qu'on te rejoigne)", font=("Arial", 10, "italic"), fg="#F1C40F", bg="#2C3E50").pack(pady=0)
+        room_name = "Inconnu"
+        for r in self.app.state.available_rooms:
+            if r.get("id") == self.app.state.room_id:
+                room_name = r.get("name")
+                break
+
+        tk.Label(self, text=f"Lobby - {room_name}", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
+        tk.Label(self, text=f"ID secret : {self.app.state.room_id}", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50").pack(pady=0)
         tk.Label(self, text=f"Connecté : {self.app.state.pseudo}", font=("Arial", 12), fg="lightgray", bg="#2C3E50").pack(pady=5)
 
         self.players_label = tk.Label(self, text="Joueurs en ligne :\n- " + self.app.state.pseudo, font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
         self.players_label.pack(pady=20)
 
         self.ready_btn = tk.Button(self, text="Je suis prêt !", font=("Arial", 14, "bold"), bg="#E67E22", fg="white", command=self.toggle_ready)
-        self.ready_btn.pack(pady=30)
+        self.ready_btn.pack(pady=10)
+
+        tk.Button(self, text="Quitter la salle", font=("Arial", 12), bg="#C0392B", fg="white", command=self.leave_room).pack(pady=20)
 
     def toggle_ready(self):
         self.app.state.is_ready = not self.app.state.is_ready
@@ -113,11 +146,22 @@ class LobbyScreen(tk.Frame):
         topic = topics.t_player_ready(self.app.state.room_id, self.app.state.pseudo)
         self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
 
+    def leave_room(self):
+        topic = topics.t_player_presence(self.app.state.room_id, self.app.state.pseudo)
+        self.app.net.client.publish_json(topic, {"status": "offline", "pseudo": self.app.state.pseudo, "ts": int(time.time())}, retain=True)
+        
+        self.app.state.is_ready = False
+        self.app.state.players = []
+        
+        self.app.net.connect_menu()
+        self.app.show_screen("MENU")
+
     def update_players_list(self):
-        text = "Joueurs en ligne :\n"
+        text = "Joueur(s) en ligne :\n"
         for p in self.app.state.players:
             text += f"- {p}\n"
         self.players_label.config(text=text)
+
 
 class DrawScreen(tk.Frame):
     def __init__(self, parent, app):

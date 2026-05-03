@@ -78,7 +78,18 @@ class NetworkManager:
 
     def _on_state(self, topic, payload, retain):
         if not payload: return
-        phase = payload.get("phase")
-        if phase and phase != self.state.phase:
-            self.state.phase = phase
-            self.app.after(0, lambda: self.app.show_screen(phase))
+        
+        self.state.phase = payload.get("phase", self.state.phase)
+        self.state.round = payload.get("round", self.state.round)
+        self.state.total_rounds = payload.get("total_rounds", self.state.total_rounds)
+        self.state.deadline_ts = payload.get("deadline_ts", self.state.deadline_ts)
+        self.state.players_order = payload.get("players_order", self.state.players_order)
+        self.state.version = payload.get("version", self.state.version)
+        
+        if hasattr(self.app, 'current_screen'):
+             current_phase = self.app.current_screen.__class__.__name__.replace("Screen", "").upper()
+             if self.state.phase != current_phase:
+                 if self.state.phase == "LOBBY" and current_phase == "MENU":
+                     pass
+                 else:
+                     self.app.after(0, lambda: self.app.show_screen(self.state.phase))
