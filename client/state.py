@@ -6,6 +6,7 @@ class ClientState:
         self.room_id = ""
         self.is_ready = False
         self.players = []
+        self.ready_players = []
         
         self.phase = Phase.LOBBY.value
         self.round = 0
@@ -16,3 +17,4 @@ class ClientState:
 
         self.server_online = False
         self.available_rooms = []
+        

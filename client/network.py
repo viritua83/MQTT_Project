@@ -11,6 +11,7 @@ class NetworkManager:
     def connect_menu(self):
         if self.client:
             self.client.disconnect()
+            time.sleep(0.2)
 
         client_id = f"client-menu-{int(time.time())}"
 
@@ -41,6 +42,7 @@ class NetworkManager:
         )
 
         self.client.on_message_for(topics.sub_all_player_presence(room_id), self._on_presence)
+        self.client.on_message_for(topics.sub_all_player_ready(room_id), self._on_player_ready)
         self.client.on_message_for(topics.t_state(room_id), self._on_state)
 
         self.client.on_ready(self._publish_online)
@@ -72,6 +74,19 @@ class NetworkManager:
             self.state.players.append(pseudo)
         elif status == "offline" and pseudo in self.state.players:
             self.state.players.remove(pseudo)
+
+        if hasattr(self.app.current_screen, 'update_players_list'):
+            self.app.after(0, self.app.current_screen.update_players_list)
+
+    def _on_player_ready(self, topic, payload, retain):
+        if not payload: return
+        pseudo = payload.get("pseudo")
+        is_ready = payload.get("ready")
+
+        if is_ready and pseudo not in self.state.ready_players:
+            self.state.ready_players.append(pseudo)
+        elif not is_ready and pseudo in self.state.ready_players:
+            self.state.ready_players.remove(pseudo)
 
         if hasattr(self.app.current_screen, 'update_players_list'):
             self.app.after(0, self.app.current_screen.update_players_list)
