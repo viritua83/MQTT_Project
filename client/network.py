@@ -43,6 +43,7 @@ class NetworkManager:
 
         self.client.on_message_for(topics.sub_all_player_presence(room_id), self._on_presence)
         self.client.on_message_for(topics.sub_all_player_ready(room_id), self._on_player_ready)
+        self.client.on_message_for(topics.sub_all_albums(room_id), self._on_album)
         self.client.on_message_for(topics.t_state(room_id), self._on_state)
 
         self.client.on_ready(self._publish_online)
@@ -90,6 +91,16 @@ class NetworkManager:
 
         if hasattr(self.app.current_screen, 'update_players_list'):
             self.app.after(0, self.app.current_screen.update_players_list)
+
+    def _on_album(self, topic, payload, retain):
+        if not payload: return
+        album_id = payload.get("album_id")
+        round_n = payload.get("round")
+        
+        if album_id and round_n is not None:
+            if album_id not in self.state.albums:
+                self.state.albums[album_id] = {}
+            self.state.albums[album_id][round_n] = payload
 
     def _on_state(self, topic, payload, retain):
         if not payload: return
