@@ -1,20 +1,24 @@
 """
 Orchestrateur principal du serveur arbitre Gartic Phone.
 
-Responsabilités à l'étape 1 :
+Responsabilités à l'étape 2 :
   - Connexion au broker MQTT avec une LWT serveur globale.
   - Souscription aux wildcards globaux pour observer toutes les rooms.
-  - Publication initiale de server/presence (online) et rooms-index (vide).
-  - Détection (via log) des rooms existantes au démarrage — la reprise
-    réelle viendra à l'étape 2 quand on aura les RoomController.
-  - Arrêt propre : publication explicite de server/presence (offline) avant
-    la déconnexion.
+  - Publication initiale de server/presence (online) et rooms-index.
+  - Création de rooms à la réception de rooms-create.
+  - Maintenance de rooms-index (republié à chaque mutation).
+  - Gestion de la présence joueur : ajout/retrait dans la room.
+  - Suppression automatique des rooms vides (avec clear des retained).
+  - Reprise complète après crash : recréer les RoomController depuis
+    les retained de l'index et des states, peupler online_players
+    depuis les retained presence reçus pendant la fenêtre de reprise.
+  - Arrêt propre : publication explicite de server/presence (offline)
+    avant la déconnexion.
 
-Étapes suivantes (déjà préparées dans la structure) :
-  - Étape 2 : création/suppression de rooms (handler de rooms-create,
-    dictionnaire rooms: Dict[str, RoomController], maintenance de
-    rooms-index).
-  - Étape 3+ : démarrage automatique des parties, boucle des rounds, etc.
+Étapes suivantes :
+  - Étape 3 : démarrage automatique des parties (ready + transition LOBBY→WRITE).
+  - Étape 4 : collecte des soumissions, consolidation des albums, boucle des rounds.
+  - Étape 6 : phase REVEAL et END.
 """
 from __future__ import annotations
 
@@ -25,7 +29,9 @@ from typing import Any, Dict
 
 from shared import topics
 from shared.mqtt_client import GarticMqttClient
-from shared.protocol import PresenceStatus
+from shared.protocol import Phase, PresenceStatus
+
+from server.room_controller import RoomController
 
 log = logging.getLogger("server.app")
 
@@ -49,9 +55,10 @@ class ServerApp:
 
     def __init__(self) -> None:
         # Dictionnaire room_id -> contrôleur de room.
-        # Vide à l'étape 1, rempli à l'étape 2 quand on traitera rooms-create.
-        # On le déclare quand même ici pour avoir la structure en place.
-        self.rooms: Dict[str, Any] = {}
+        # Une instance par room active. À l'étape 2A on le remplit via
+        # _on_rooms_create. À l'étape 2B la reprise après crash le pré-remplira
+        # à partir des retained.
+        self.rooms: Dict[str, RoomController] = {}
 
         # Lock pour protéger self.rooms et self._index_version, accédés
         # potentiellement depuis plusieurs callbacks paho (qui tournent
@@ -107,12 +114,13 @@ class ServerApp:
     def _register_handlers(self) -> None:
         """Enregistre tous les handlers MQTT.
 
-        À l'étape 1 on souscrit aux wildcards globaux, mais la plupart des
-        handlers ne font que loguer pour vérifier que le routage marche.
-        Ils seront remplis à mesure qu'on avance dans les étapes.
+        On souscrit aux wildcards globaux, ce qui nous permet d'observer
+        tous les évènements de toutes les rooms en une seule souscription.
+        Le routage par room_id se fait au moment du callback, en extrayant
+        le room_id depuis le topic reçu.
         """
-        # rooms-index retained : utile pour la reprise au démarrage.
-        # On veut savoir si des rooms existaient avant qu'on crash.
+        # rooms-index retained : sert à la reprise au démarrage
+        # (on récupère la liste des rooms qui existaient avant un crash).
         self.mqtt.on_message_for(
             topics.t_rooms_index(),
             self._on_rooms_index_retained,
@@ -120,17 +128,24 @@ class ServerApp:
         )
 
         # rooms-create : déclenché par les clients pour créer une room.
-        # QoS 0 par contrat, mais on le re-déclare ici par cohérence avec
-        # les autres souscriptions.
+        # QoS 0 par contrat (best-effort, le client a un timeout en GUI).
         self.mqtt.on_message_for(
             topics.t_rooms_create(),
             self._on_rooms_create,
             qos=0,
         )
 
+        # rooms/+/state retained : pour la reprise après crash. Hors
+        # reprise, ces messages sont nos propres échos qu'on ignore.
+        self.mqtt.on_message_for(
+            f"{topics.PREFIX}/rooms/+/state",
+            self._on_room_state_retained,
+            qos=1,
+        )
+
         # Wildcards globaux pour observer tous les évènements joueurs
-        # de toutes les rooms. À l'étape 1 on ne fait que loguer.
-        # On extrait le room_id du topic au moment du routage.
+        # de toutes les rooms. On extrait le room_id du topic au moment
+        # du routage.
         self.mqtt.on_message_for(
             f"{topics.PREFIX}/rooms/+/presence/+",
             self._on_player_presence,
@@ -241,19 +256,49 @@ class ServerApp:
         """Attend la fin de la fenêtre de reprise puis publie l'état serveur.
 
         Pendant la fenêtre, les retained reçus sont accumulés par les
-        handlers (`_on_rooms_index_retained`, `_on_player_presence`, etc.)
-        qui s'autorisent à mettre à jour les structures internes mais
-        s'interdisent de PUBLIER quoi que ce soit (le drapeau
-        self._recovery_done n'est pas encore set).
+        handlers (_on_rooms_index_retained, _on_room_state_retained,
+        _on_player_presence) qui mettent à jour self.rooms mais NE
+        publient PAS (le flag self._recovery_done n'est pas encore set).
+
+        Une fois la fenêtre écoulée, on :
+          1. Set le flag _recovery_done : à partir de maintenant les
+             handlers publient à nouveau (les retained suivants seront
+             traités comme du live).
+          2. Publie server/presence online.
+          3. Republie les states retained reconstitués (au cas où
+             notre state interne aurait des infos plus à jour que les
+             retained existants — par exemple si on a reçu des presence
+             pendant la fenêtre, n_players a bougé).
+          4. Republie rooms-index reconstitué.
+
+        L'ordre est important : on publie SOI-même online APRÈS avoir
+        publié les states. Comme ça, dès qu'un client voit le serveur
+        online, il sait que les autres retained sont déjà à jour.
         """
         time.sleep(RECOVERY_WINDOW_S)
         self._recovery_done.set()
         log.info("Fenêtre de reprise terminée")
 
-        # Maintenant qu'on a (théoriquement) reçu les retained existants,
-        # on annonce notre présence et on publie l'index.
-        self._publish_server_online()
+        # Si on a reconstitué des rooms, on republie leurs states pour
+        # que les clients aient un index et des states cohérents.
+        with self._rooms_lock:
+            recovered_rooms = list(self.rooms.values())
+
+        if recovered_rooms:
+            log.info(
+                "Reprise effective : %d rooms reconstituées, republication",
+                len(recovered_rooms),
+            )
+            for room in recovered_rooms:
+                self._publish_room_state(room)
+
+        # Republie l'index AVEC les rooms reconstituées (n_players et
+        # phase à jour).
         self._publish_rooms_index()
+
+        # Annonce de notre présence en dernier : le client comprend
+        # qu'à partir de ce moment le serveur est opérationnel.
+        self._publish_server_online()
 
     def _publish_server_online(self) -> None:
         """Publie server/presence à online (retained)."""
@@ -272,14 +317,22 @@ class ServerApp:
     def _publish_rooms_index(self) -> None:
         """Publie le rooms-index retained à partir de l'état interne.
 
-        À l'étape 1 self.rooms est toujours vide donc on publie une liste
-        vide. À l'étape 2+, on listera les rooms gérées avec leurs métadonnées.
+        Construit le payload depuis self.rooms en demandant à chaque
+        RoomController son to_index_entry().
+
+        À appeler après chaque mutation de self.rooms (création, suppression)
+        OU après tout changement qui affecte une entrée d'index (n_players
+        qui change, phase qui change). Concrètement appelée par :
+          - _on_rooms_create (étape 2A)
+          - _on_player_presence (étape 2B)
+          - les transitions de phase dans RoomController (étapes 3+)
         """
         with self._rooms_lock:
             self._index_version += 1
             payload = {
                 "rooms": [
-                    # À l'étape 2, ce sera : room.to_index_entry()
+                    room.to_index_entry()
+                    for room in self.rooms.values()
                 ],
                 "version": self._index_version,
             }
@@ -294,8 +347,91 @@ class ServerApp:
             payload["version"], len(payload["rooms"]),
         )
 
+    def _publish_room_state(self, room: RoomController) -> None:
+        """Publie le retained rooms/<id>/state pour une room donnée.
+
+        Appelé :
+          - À la création de la room (état initial LOBBY).
+          - Aux transitions de phase (étapes 3+).
+          - À la republication du state lors d'un changement de joueur en
+            LOBBY (la liste des joueurs étant utilisée par les clients
+            pour afficher le lobby).
+
+        Note : to_state_payload() incrémente self.version dans la room.
+        Donc chaque appel à cette méthode produit un payload avec une
+        version strictement croissante, ce qui permet aux clients de
+        détecter les messages dans le désordre.
+        """
+        payload = room.to_state_payload()
+        self.mqtt.publish_json(
+            topics.t_state(room.room_id),
+            payload,
+            qos=1,
+            retain=True,
+        )
+        log.info(
+            "[%s] state publié : phase=%s round=%d/%d version=%d",
+            room.room_id,
+            payload["phase"],
+            payload["round"],
+            payload["total_rounds"],
+            payload["version"],
+        )
+
+    def _delete_room(self, room_id: str) -> None:
+        """Supprime une room et nettoie tous ses retained.
+
+        Appelée quand le dernier joueur quitte une room (online_players
+        devient vide). Ce nettoyage est crucial : sans lui, des retained
+        orphelins traîneraient sur le broker et pollueraient les démarrages
+        suivants (la reprise les retrouverait et recréerait des rooms
+        fantômes vides).
+
+        Liste des retained à effacer pour une room :
+          - rooms/<id>/state
+          - rooms/<id>/presence/<pseudo>  (un par pseudo qu'on a vu)
+          - rooms/<id>/ready/<pseudo>     (idem)
+          - rooms/<id>/reveal/current     (étape 6)
+          - rooms/<id>/albums/...         (étape 4, pas encore présents en
+                                            étape 2)
+          - rooms/<id>/submissions/...    (étape 4, pas encore présents)
+
+        À l'étape 2 on n'a que les 4 premiers types à gérer. À l'étape
+        4+ on ajoutera albums et submissions.
+
+        On retire la room du dico AVANT le clear pour éviter qu'un
+        retained presence offline qui arriverait pendant le clear ne
+        re-trigger _delete_room.
+        """
+        with self._rooms_lock:
+            room = self.rooms.pop(room_id, None)
+        if room is None:
+            log.debug("Tentative de suppression d'une room inconnue : %s", room_id)
+            return
+
+        log.info(
+            "[%s] Suppression de la room (joueurs vus : %d)",
+            room_id, len(room.seen_players),
+        )
+
+        # Clear du state retained.
+        self.mqtt.clear_retained(topics.t_state(room_id))
+
+        # Clear de chaque retained presence/<pseudo> et ready/<pseudo>
+        # pour les pseudos qu'on a vus passer.
+        for pseudo in room.seen_players:
+            self.mqtt.clear_retained(topics.t_player_presence(room_id, pseudo))
+            self.mqtt.clear_retained(topics.t_player_ready(room_id, pseudo))
+
+        # Clear de reveal/current (peut ne pas exister mais clear est
+        # idempotent : si rien n'était retained, ça ne fait rien).
+        self.mqtt.clear_retained(topics.t_reveal_current(room_id))
+
+        # Republie l'index sans cette room.
+        self._publish_rooms_index()
+
     # ------------------------------------------------------------------
-    # Handlers de messages (étape 1 : simples logs)
+    # Handlers de messages
     # ------------------------------------------------------------------
 
     def _on_rooms_index_retained(
@@ -306,12 +442,18 @@ class ServerApp:
     ) -> None:
         """Reçu pendant la fenêtre de reprise OU après nos propres publishes.
 
-        À l'étape 1 :
-          - Si reçu PENDANT la reprise et que le payload contient des rooms,
-            on le logue (information utile pour la démo : "tiens, il y avait
-            des rooms avant le crash").
-          - Si reçu APRÈS la reprise, c'est juste l'écho de notre propre
-            publish, on ignore.
+        Comportement :
+          - Si on est APRÈS la fenêtre de reprise → c'est l'écho de notre
+            propre publish, on ignore.
+          - Si on est PENDANT la fenêtre de reprise et que l'index contient
+            des rooms → on recrée des RoomController (squelettes vides) à
+            partir des entrées d'index. Les retained `state` et `presence`
+            qu'on est en train de recevoir en parallèle vont compléter ces
+            squelettes (dans _on_room_state_retained et _on_player_presence).
+
+        Une fois la fenêtre de reprise terminée, _run_recovery_window()
+        republie l'index reconstitué (avec les bons n_players à jour
+        grâce aux presence retained reçus entre temps).
         """
         if self._recovery_done.is_set():
             # C'est l'écho de notre propre publish, rien à faire.
@@ -319,15 +461,94 @@ class ServerApp:
 
         if not isinstance(payload, dict):
             return
+
         existing = payload.get("rooms", [])
-        if existing:
-            log.info(
-                "Rooms existantes détectées au démarrage : %s "
-                "(reprise complète prévue à l'étape 2)",
-                [r.get("id") for r in existing],
-            )
-        else:
+        if not existing:
             log.info("Aucune room existante (index vide ou absent)")
+            return
+
+        log.info(
+            "Reprise : %d rooms détectées dans l'index (%s)",
+            len(existing), [r.get("id") for r in existing],
+        )
+
+        # Recrée des RoomController squelettes pour chaque room de l'index.
+        # Les détails (phase, round, players_order) seront remplis par
+        # les retained `state` qui vont arriver, et les online_players
+        # par les retained `presence`.
+        with self._rooms_lock:
+            for entry in existing:
+                room_id = entry.get("id")
+                name = entry.get("name", "?")
+                if not isinstance(room_id, str) or room_id in self.rooms:
+                    continue
+                room = RoomController(room_id=room_id, name=name)
+                # On essaie de remettre la phase si l'index la donne, mais
+                # ce n'est qu'un fallback : le retained `state` la remplacera.
+                try:
+                    room.phase = Phase(entry.get("phase", "LOBBY"))
+                except ValueError:
+                    room.phase = Phase.LOBBY
+                self.rooms[room_id] = room
+                log.info("[%s] Room reconstruite (squelette) : name=%r", room_id, name)
+
+    def _on_room_state_retained(
+        self,
+        topic: str,
+        payload: Any,
+        retain: bool,
+    ) -> None:
+        """Reçu pour `rooms/<id>/state`.
+
+        Pendant la fenêtre de reprise, ce handler complète le squelette
+        de RoomController créé par _on_rooms_index_retained avec les
+        détails de la partie en cours (phase, round, deadline, etc.).
+
+        Hors fenêtre de reprise, c'est l'écho de notre propre publish.
+        On ignore alors.
+        """
+        if self._recovery_done.is_set():
+            return
+        if not isinstance(payload, dict):
+            return
+
+        # Format topic : <PREFIX>/rooms/<room_id>/state
+        parts = topic.split("/")
+        try:
+            room_id = parts[-2]
+        except IndexError:
+            return
+
+        with self._rooms_lock:
+            room = self.rooms.get(room_id)
+
+        if room is None:
+            log.debug(
+                "state retained reçu pour room inconnue %s pendant reprise",
+                room_id,
+            )
+            return
+
+        # Reconstruit l'état à partir du payload retained.
+        try:
+            room.phase = Phase(payload.get("phase", "LOBBY"))
+            room.round_n = int(payload.get("round", 0))
+            room.total_rounds = int(payload.get("total_rounds", 0))
+            room.deadline_ts = int(payload.get("deadline_ts", 0))
+            room.players_order = list(payload.get("players_order", []))
+            # On reprend la version pour rester monotone : la prochaine
+            # publication aura version+1, ce qui évite que les clients
+            # voient un retour en arrière.
+            room.version = int(payload.get("version", 0))
+        except (ValueError, TypeError):
+            log.exception("[%s] state retained mal formé, room en LOBBY", room_id)
+            return
+
+        log.info(
+            "[%s] state restauré : phase=%s round=%d/%d version=%d",
+            room_id, room.phase.value, room.round_n,
+            room.total_rounds, room.version,
+        )
 
     def _on_rooms_create(
         self,
@@ -335,11 +556,66 @@ class ServerApp:
         payload: Any,
         retain: bool,
     ) -> None:
-        """Demande de création de room (étape 2).
+        """Demande de création de room par un client.
 
-        À l'étape 1 on ignore — on logue pour montrer que le routage marche.
+        Format payload attendu (cf shared/schemas.py:RoomsCreatePayload) :
+            {"room_id": "<hex 6>", "name": "<str>"}
+
+        Politique :
+          - Validation minimale : room_id et name doivent être présents et
+            non vides.
+          - Si l'id existe déjà → on log un warning et on ignore. Le client
+            verra son timeout côté GUI et pourra retenter avec un autre id.
+            (Décision actée : pas de feedback explicite côté client.)
+          - Sinon : on crée le RoomController, on l'ajoute au dico, on
+            publie le state retained initial, on republie l'index.
+
+        Note : ce handler tourne dans le thread paho (callback de
+        message_callback_add). Toutes les manipulations de self.rooms
+        sont protégées par self._rooms_lock.
         """
-        log.info("rooms-create reçu : %r (ignoré à l'étape 1)", payload)
+        # Validation du format.
+        if not isinstance(payload, dict):
+            log.warning("rooms-create reçu avec payload non-dict : %r", payload)
+            return
+        room_id = payload.get("room_id")
+        name = payload.get("name")
+        if not isinstance(room_id, str) or not room_id:
+            log.warning("rooms-create avec room_id invalide : %r", payload)
+            return
+        if not isinstance(name, str) or not name:
+            log.warning("rooms-create avec name invalide : %r", payload)
+            return
+
+        # Création + check de collision sous lock.
+        # On ne libère le lock qu'après avoir ajouté la room, ce qui
+        # garantit qu'aucune autre création concurrente avec le même id
+        # ne passera (improbable mais possible si deux clients génèrent
+        # le même hex en même temps).
+        with self._rooms_lock:
+            if room_id in self.rooms:
+                # Décision actée : on ignore en silence côté MQTT.
+                # Le warning est utile pour le debug pendant la démo.
+                log.warning(
+                    "Collision room_id=%s (existant: name=%r, demandé: name=%r) — ignoré",
+                    room_id,
+                    self.rooms[room_id].name,
+                    name,
+                )
+                return
+            room = RoomController(room_id=room_id, name=name)
+            self.rooms[room_id] = room
+
+        log.info("Room créée : id=%s name=%r", room_id, name)
+
+        # Publication du state retained initial de la room.
+        # Important : c'est ce que le client surveille (en plus de l'index)
+        # pour savoir qu'il peut entrer dans la room.
+        self._publish_room_state(room)
+
+        # Republication de l'index pour que tous les clients voient
+        # apparaître la nouvelle room dans leur menu.
+        self._publish_rooms_index()
 
     def _on_player_presence(
         self,
@@ -347,20 +623,100 @@ class ServerApp:
         payload: Any,
         retain: bool,
     ) -> None:
-        """Présence d'un joueur dans une room (étape 2+).
+        """Présence d'un joueur dans une room.
 
-        À l'étape 1 on ne fait que loguer pour valider que les wildcards
-        fonctionnent et que le routage par room_id sera possible.
+        Ce handler reçoit deux types de messages :
+          - Les publishes "live" des clients (un joueur passe online ou
+            offline).
+          - Les retained reçus pendant la fenêtre de reprise après un
+            redémarrage du serveur (utilisés pour reconstruire l'état).
+
+        Politique :
+          - Si la room n'existe pas dans self.rooms, on ignore. Cas
+            possible : un retained presence d'une room déjà supprimée
+            qu'on n'a pas encore réussi à effacer.
+          - Si online → add_player. Si nouveauté → republie l'index.
+          - Si offline → remove_player. Si la room devient vide → on la
+            supprime (delete + clear retained).
+
+        Pendant la fenêtre de reprise, ce handler est aussi déclenché
+        par les retained mais le comportement est exactement le même
+        (la reprise consiste justement à reconstruire l'état à partir
+        de ces retained).
         """
         # Format du topic : <PREFIX>/rooms/<room_id>/presence/<pseudo>
         room_id, pseudo = self._extract_room_and_user(topic)
         if room_id is None:
             return
-        status = payload.get("status") if isinstance(payload, dict) else None
-        log.info(
-            "[%s] presence/%s = %s (retain=%s)",
-            room_id, pseudo, status, retain,
-        )
+
+        # Payload vide (None) : c'est un "clear retained" — soit le nôtre
+        # qu'on entend en écho après un _delete_room, soit celui d'un
+        # client qui s'est désinscrit proprement. Aucune action utile.
+        if payload is None:
+            log.debug("presence vide (clear retained) sur %s — ignoré", topic)
+            return
+
+        if not isinstance(payload, dict):
+            log.warning("presence avec payload inattendu : topic=%s payload=%r",
+                        topic, payload)
+            return
+
+        status = payload.get("status")
+        if status not in (PresenceStatus.ONLINE.value, PresenceStatus.OFFLINE.value):
+            log.warning("presence avec status inconnu (%r) : topic=%s", status, topic)
+            return
+
+        # Recherche de la room cible.
+        with self._rooms_lock:
+            room = self.rooms.get(room_id)
+
+        if room is None:
+            # Room inconnue : ça peut arriver si on reçoit un retained
+            # d'une room déjà supprimée (le retained survit jusqu'à ce
+            # qu'on le clear). On efface ce retained orphelin pour
+            # nettoyer le broker.
+            log.info(
+                "presence reçu pour room inconnue %s, effacement du retained",
+                room_id,
+            )
+            self.mqtt.clear_retained(topic)
+            return
+
+        # Application au RoomController.
+        if status == PresenceStatus.ONLINE.value:
+            is_new = room.add_player(pseudo)
+            if is_new:
+                log.info(
+                    "[%s] %s rejoint la room (online=%d)",
+                    room_id, pseudo, len(room.online_players),
+                )
+                # On republie l'index parce que n_players a changé.
+                self._publish_rooms_index()
+        else:
+            # offline
+            was_present = room.remove_player(pseudo)
+            # On marque seen même si le joueur n'était pas dans online :
+            # ça peut être un retained offline orphelin qui arrive en
+            # reprise, on veut quand même pouvoir nettoyer son retained
+            # à la fin.
+            room.mark_seen(pseudo)
+
+            if was_present:
+                log.info(
+                    "[%s] %s quitte la room (online=%d)",
+                    room_id, pseudo, len(room.online_players),
+                )
+
+            # Si la room est vide, on la supprime.
+            # On vérifie cette condition même si was_present est False :
+            # imagine un retained offline arrivant pour la dernière
+            # personne au démarrage du serveur ; on doit quand même
+            # supprimer la room.
+            if room.is_empty():
+                self._delete_room(room_id)
+            elif was_present:
+                # Pas vide mais quelqu'un est parti : republie l'index.
+                self._publish_rooms_index()
 
     def _on_player_ready(
         self,
@@ -368,9 +724,18 @@ class ServerApp:
         payload: Any,
         retain: bool,
     ) -> None:
-        """État ready d'un joueur (étape 3)."""
+        """État ready d'un joueur (étape 3).
+
+        À l'étape 2 on ne fait que loguer pour valider que les wildcards
+        fonctionnent. La logique de comptage et de démarrage automatique
+        viendra à l'étape 3.
+        """
         room_id, pseudo = self._extract_room_and_user(topic)
         if room_id is None:
+            return
+        # Payload vide = clear retained (suppression de room par exemple).
+        # On ignore silencieusement.
+        if payload is None:
             return
         ready = payload.get("ready") if isinstance(payload, dict) else None
         log.info(
