@@ -29,7 +29,7 @@ from typing import Any, Dict
 
 from shared import topics
 from shared.mqtt_client import GarticMqttClient
-from shared.protocol import Phase, PresenceStatus
+from shared.protocol import Phase, PresenceStatus, MIN_PLAYERS
 
 from server.room_controller import RoomController
 
@@ -77,6 +77,14 @@ class ServerApp:
 
         # Évènement signalé par stop() pour faire sortir run() de sa boucle.
         self._shutdown = threading.Event()
+
+        # Timers de fin de round, indexés par room_id (étape 3).
+        # Un seul timer actif à la fois par room. Stocké pour pouvoir
+        # l'annuler proprement si la room est supprimée pendant la partie
+        # ou si le serveur s'arrête.
+        # À l'étape 3 le callback du timer ne fait rien (no-op). À l'étape
+        # 4 il déclenchera la consolidation des soumissions.
+        self._round_timers: Dict[str, threading.Timer] = {}
 
         # Configuration du client MQTT avec la LWT serveur globale.
         # Le payload de la LWT est ce que le broker publiera automatiquement
@@ -199,6 +207,14 @@ class ServerApp:
         ferme la connexion.
         """
         log.info("Arrêt demandé, publication offline")
+
+        # Annule les timers de round en cours pour éviter qu'ils se
+        # déclenchent pendant l'arrêt et tentent de publier sur une
+        # connexion fermée. cancel() est idempotent et thread-safe.
+        for room_id, timer in list(self._round_timers.items()):
+            timer.cancel()
+        self._round_timers.clear()
+
         try:
             self.mqtt.publish_json(
                 topics.t_server_presence(),
@@ -408,6 +424,14 @@ class ServerApp:
         if room is None:
             log.debug("Tentative de suppression d'une room inconnue : %s", room_id)
             return
+
+        # Annule le timer de round si la room était en cours de partie.
+        # Sans ça, le callback s'exécuterait sur une room déjà supprimée
+        # (le callback gère ce cas mais autant être propre).
+        timer = self._round_timers.pop(room_id, None)
+        if timer is not None:
+            timer.cancel()
+            log.info("[%s] Timer de round annulé (suppression room)", room_id)
 
         log.info(
             "[%s] Suppression de la room (joueurs vus : %d)",
@@ -706,6 +730,13 @@ class ServerApp:
                     "[%s] %s quitte la room (online=%d)",
                     room_id, pseudo, len(room.online_players),
                 )
+                # Étape 3 : on efface aussi le retained ready/<pseudo>.
+                # remove_player() a retiré le pseudo du set ready côté
+                # serveur, mais le retained MQTT subsiste. Sans ce clear,
+                # un joueur qui se reconnecterait verrait son ancien
+                # ready=true via le retained et apparaîtrait prêt sans
+                # avoir cliqué. Le clear est idempotent.
+                self.mqtt.clear_retained(topics.t_player_ready(room_id, pseudo))
 
             # Si la room est vide, on la supprime.
             # On vérifie cette condition même si was_present est False :
@@ -726,21 +757,199 @@ class ServerApp:
     ) -> None:
         """État ready d'un joueur (étape 3).
 
-        À l'étape 2 on ne fait que loguer pour valider que les wildcards
-        fonctionnent. La logique de comptage et de démarrage automatique
-        viendra à l'étape 3.
+        Met à jour le set ready_players de la room, puis évalue si la
+        partie peut démarrer automatiquement (cf RoomController.can_start).
+        Si oui, déclenche start_game() et publie les nouveaux états.
+
+        Cas particuliers gérés :
+          - payload vide (clear retained) : ignoré, c'est un nettoyage.
+          - room inconnue : retained orphelin, on l'efface du broker.
+          - joueur pas encore vu online : set_ready retournera False et
+            on n'évalue pas can_start. Le client republiera son ready
+            à la prochaine reconnexion (cf fake_client.on_room_ready).
+          - phase != LOBBY : set_ready retourne False, le retained
+            obsolète n'a aucun effet. Utile en cas de reprise après
+            crash en plein WRITE.
         """
         room_id, pseudo = self._extract_room_and_user(topic)
         if room_id is None:
             return
-        # Payload vide = clear retained (suppression de room par exemple).
-        # On ignore silencieusement.
+
+        # Payload vide = clear retained. On ignore silencieusement
+        # (publié par _delete_room ou par _clear_room_ready).
         if payload is None:
+            log.debug("ready vide (clear retained) sur %s — ignoré", topic)
             return
-        ready = payload.get("ready") if isinstance(payload, dict) else None
+
+        if not isinstance(payload, dict):
+            log.warning("ready avec payload inattendu : topic=%s payload=%r",
+                        topic, payload)
+            return
+
+        ready_value = payload.get("ready")
+        if not isinstance(ready_value, bool):
+            log.warning("ready avec valeur invalide (%r) : topic=%s",
+                        ready_value, topic)
+            return
+
+        # Recherche de la room cible.
+        with self._rooms_lock:
+            room = self.rooms.get(room_id)
+
+        if room is None:
+            # Retained orphelin d'une room déjà supprimée. On nettoie.
+            log.info(
+                "ready reçu pour room inconnue %s, effacement du retained",
+                room_id,
+            )
+            self.mqtt.clear_retained(topic)
+            return
+
+        # Mise à jour du set ready dans la room. set_ready() retourne
+        # True uniquement s'il y a eu un vrai changement d'état (et que
+        # le joueur est online + on est en LOBBY).
+        changed = room.set_ready(pseudo, ready_value)
+        if not changed:
+            # Pas de changement effectif : soit le joueur n'est pas online,
+            # soit on n'est plus en LOBBY, soit le ready était déjà à cette
+            # valeur. Rien à propager.
+            log.debug(
+                "[%s] ready/%s = %s sans effet (online=%s, phase=%s)",
+                room_id, pseudo, ready_value,
+                pseudo in room.online_players,
+                room.phase.value,
+            )
+            return
+
         log.info(
-            "[%s] ready/%s = %s (retain=%s)",
-            room_id, pseudo, ready, retain,
+            "[%s] %s passe à ready=%s (%d/%d prêts)",
+            room_id, pseudo, ready_value,
+            len(room.ready_players), len(room.online_players),
+        )
+
+        # Vérifie si on peut démarrer la partie automatiquement.
+        self._check_and_maybe_start(room)
+
+    def _check_and_maybe_start(self, room: RoomController) -> None:
+        """Vérifie can_start() et démarre la partie si la condition est vraie.
+
+        Extraite en méthode séparée pour deux raisons :
+          1. Lisibilité : _on_player_ready reste focalisé sur le parsing
+             et la mise à jour, le démarrage est une responsabilité distincte.
+          2. Réutilisabilité : à l'étape 6 (retour LOBBY après END), on
+             pourra rappeler can_start sans passer par un message ready.
+
+        Étapes du démarrage (séquence importante pour la cohérence) :
+          1. RoomController.start_game() : transition LOBBY → WRITE,
+             fige players_order, calcule deadline_ts.
+          2. Publie le state retained avec phase=WRITE. Les clients
+             utilisent ce message pour basculer vers leur WriteScreen.
+          3. Republie rooms-index : la phase de la room a changé,
+             les autres clients (dans le menu) doivent voir l'update.
+          4. Arme le timer du round 0 sur DURATION_WRITE_S. À l'étape 3,
+             le callback ne fait rien ; à l'étape 4 il déclenchera la
+             consolidation des soumissions.
+        """
+        if not room.can_start():
+            return
+
+        log.info(
+            "[%s] Démarrage automatique : %d joueurs tous prêts",
+            room.room_id, len(room.online_players),
+        )
+        room.start_game()
+
+        # Ordre : state d'abord (les clients dans la room basculent),
+        # index ensuite (les clients hors room voient le changement).
+        self._publish_room_state(room)
+        self._publish_rooms_index()
+
+        # Calcule la durée restante du round à partir de la deadline
+        # plutôt qu'en hardcodant DURATION_WRITE_S : c'est plus robuste
+        # (si on ajoute une logique d'ajustement de deadline plus tard,
+        # le timer suivra automatiquement).
+        remaining_s = max(0.0, room.deadline_ts - time.time())
+        self._arm_round_timer(room.room_id, room.round_n, remaining_s)
+
+    def _arm_round_timer(
+        self,
+        room_id: str,
+        round_n: int,
+        duration_s: float,
+    ) -> None:
+        """Arme un threading.Timer pour la fin du round courant.
+
+        À l'étape 3, le callback est un no-op : on log juste que le timer
+        a expiré. À l'étape 4, il déclenchera la consolidation des
+        soumissions (collecte + rotation + publication des albums) puis
+        la transition vers le round suivant.
+
+        Si un timer était déjà actif pour cette room, on l'annule avant
+        d'en armer un nouveau (ne devrait pas arriver en flux normal,
+        mais c'est une sécurité contre les bugs futurs).
+
+        Le Timer tourne dans son propre thread démon. cancel() est
+        thread-safe : si l'expiration est déjà en cours, cancel() n'a
+        pas d'effet ; le callback doit donc vérifier que l'état est
+        cohérent avant d'agir (par ex. la room existe-t-elle encore).
+        """
+        # Annule un éventuel timer précédent pour cette room.
+        previous = self._round_timers.pop(room_id, None)
+        if previous is not None:
+            previous.cancel()
+
+        timer = threading.Timer(
+            duration_s,
+            self._on_round_timer_expired,
+            args=(room_id, round_n),
+        )
+        timer.name = f"round-timer-{room_id}-r{round_n}"
+        timer.daemon = True
+        self._round_timers[room_id] = timer
+        timer.start()
+        log.info(
+            "[%s] Timer round %d armé pour %.1fs",
+            room_id, round_n, duration_s,
+        )
+
+    def _on_round_timer_expired(self, room_id: str, round_n: int) -> None:
+        """Callback exécuté à l'expiration du timer de round.
+
+        À l'étape 3 : NO-OP. On log juste pour confirmer que le câblage
+        marche. À l'étape 4 ce callback déclenchera la consolidation
+        (collecte des soumissions + rotation + publication albums +
+        transition vers round suivant ou phase REVEAL).
+
+        Avant d'agir, on vérifie que la room existe encore et que le
+        round indiqué correspond bien au round courant : un timer en
+        retard sur une room déjà passée à un round suivant ne doit pas
+        re-déclencher de consolidation. (Ne devrait pas arriver en flux
+        normal grâce à _arm_round_timer.cancel(), mais robustesse.)
+        """
+        # On retire le timer du dico : il a fait son office.
+        self._round_timers.pop(room_id, None)
+
+        with self._rooms_lock:
+            room = self.rooms.get(room_id)
+
+        if room is None:
+            log.debug(
+                "Timer round %d expiré pour room %s déjà supprimée — ignoré",
+                round_n, room_id,
+            )
+            return
+
+        if room.round_n != round_n:
+            log.debug(
+                "[%s] Timer round %d expiré mais round courant = %d — ignoré",
+                room_id, round_n, room.round_n,
+            )
+            return
+
+        # ÉTAPE 3 : on s'arrête ici. La logique réelle viendra en étape 4.
+        log.info(
+            "[%s] Timer round %d expiré (no-op étape 3, sera branché en étape 4)",
+            room_id, round_n,
         )
 
     def _on_player_submission(

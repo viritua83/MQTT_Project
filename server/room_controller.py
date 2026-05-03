@@ -14,7 +14,7 @@ Toutes les méthodes qui modifient l'état sont nommées explicitement
 (add_player, remove_player, set_ready, etc.) pour qu'on puisse tracer
 les transitions à l'oral lors de la soutenance.
 
-Étape 2 (cette version) :
+Étape 2 :
   - Constructeur (room_id, name).
   - to_index_entry() / to_state_payload() : sérialisation pour MQTT.
   - add_player / remove_player / is_empty : gestion de la présence.
@@ -22,16 +22,28 @@ les transitions à l'oral lors de la soutenance.
     utilisée par le ServerApp pour effacer les retained presence/<pseudo>
     au moment de la suppression de la room.
 
+Étape 3 (cette version) :
+  - ready_players : ensemble des joueurs ayant cliqué "prêt".
+  - set_ready(pseudo, ready) : met à jour le set ready.
+  - can_start() : True si on peut démarrer (>= MIN_PLAYERS et tous prêts).
+  - start_game() : transition LOBBY -> WRITE, fige players_order, calcule
+    total_rounds et deadline_ts.
+
 Étapes suivantes (préparées dans la structure mais pas implémentées) :
-  - 3 : système ready + démarrage automatique.
   - 4 : collecte des soumissions + transitions de rounds.
   - 6 : phase REVEAL + retour au LOBBY.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
-from shared.protocol import Phase
+from shared.protocol import (
+    Phase,
+    MIN_PLAYERS,
+    DURATION_WRITE_S,
+)
+from shared.rotation import total_rounds_for_players
 
 
 @dataclass
@@ -61,7 +73,9 @@ class RoomController:
     # les retained presence/<pseudo> reçus par le ServerApp).
     online_players: set[str] = field(default_factory=set)
 
-    # Joueurs ayant cliqué "prêt" (utilisé à l'étape 3).
+    # Joueurs ayant cliqué "prêt" (étape 3).
+    # Un joueur qui se déconnecte est automatiquement retiré de ce set
+    # via remove_player() (un joueur offline ne peut pas être prêt).
     ready_players: set[str] = field(default_factory=set)
 
     # Mémoire de TOUS les pseudos qui ont publié au moins une fois
@@ -116,7 +130,7 @@ class RoomController:
         }
 
     # ---------------------------------------------------------------
-    # Mutations (étape 2B et au-delà)
+    # Mutations présence (étape 2)
     # ---------------------------------------------------------------
 
     def add_player(self, pseudo: str) -> bool:
@@ -139,7 +153,9 @@ class RoomController:
         """Retire un joueur. Retourne True si effectivement retiré.
 
         Si le joueur avait cliqué prêt, on l'enlève aussi du set ready
-        (un joueur offline ne peut pas être "prêt").
+        (un joueur offline ne peut pas être "prêt"). Important pour
+        l'étape 3 : sinon can_start() pourrait être vrai alors qu'un
+        des "prêts" n'est plus connecté.
 
         Note : on garde le pseudo dans seen_players, on ne l'oublie pas.
         Sinon on perdrait sa trace pour le clear final des retained.
@@ -174,3 +190,85 @@ class RoomController:
         par le ServerApp via on_player_offline.
         """
         return len(self.online_players) == 0
+
+    # ---------------------------------------------------------------
+    # Système ready + démarrage (étape 3)
+    # ---------------------------------------------------------------
+
+    def set_ready(self, pseudo: str, ready: bool) -> bool:
+        """Met à jour le statut "prêt" d'un joueur. Retourne True si
+        l'état a réellement changé (utile pour décider s'il faut
+        re-évaluer can_start()).
+
+        Règle : seuls les joueurs online peuvent être prêts. Si un
+        message ready arrive pour un joueur qu'on ne voit pas online
+        (cas rare : retained ready arrivé avant retained presence),
+        on l'ignore. Le ServerApp verra le presence ensuite et le
+        client republie son ready au besoin.
+
+        On n'autorise les changements de ready qu'en phase LOBBY :
+        une fois la partie démarrée, le bouton "prêt" n'a plus de sens
+        et un retained ready obsolète ne doit pas perturber la logique.
+        """
+        if self.phase != Phase.LOBBY:
+            return False
+        if pseudo not in self.online_players:
+            return False
+
+        was_ready = pseudo in self.ready_players
+        if ready and not was_ready:
+            self.ready_players.add(pseudo)
+            return True
+        if not ready and was_ready:
+            self.ready_players.discard(pseudo)
+            return True
+        return False  # Pas de changement effectif
+
+    def can_start(self) -> bool:
+        """True si la partie peut démarrer automatiquement.
+
+        Conditions :
+          1. On est en phase LOBBY (sinon démarrage impossible/inutile).
+          2. Au moins MIN_PLAYERS joueurs online.
+          3. Tous les joueurs online sont prêts.
+
+        La condition (3) est exprimée comme "online_players ⊆ ready_players".
+        Comme remove_player() retire automatiquement du set ready, on a
+        toujours ready_players ⊆ online_players, donc l'égalité des deux
+        sets est équivalente à online_players ⊆ ready_players.
+        """
+        if self.phase != Phase.LOBBY:
+            return False
+        if len(self.online_players) < MIN_PLAYERS:
+            return False
+        return self.online_players == self.ready_players
+
+    def start_game(self) -> None:
+        """Transition LOBBY -> WRITE. Fige l'ordre des joueurs et calcule
+        les paramètres de la partie.
+
+        Précondition : can_start() doit être vrai (vérifié par le ServerApp
+        avant l'appel). On lève une AssertionError sinon, pour détecter
+        les bugs de logique côté ServerApp.
+
+        Après cet appel :
+          - phase = WRITE
+          - round_n = 0
+          - total_rounds = nb joueurs (cf shared/rotation.py)
+          - deadline_ts = maintenant + DURATION_WRITE_S
+          - players_order = liste triée alphabétiquement (déterministe)
+          - ready_players est vidé (le bouton "prêt" n'a plus de sens
+            une fois la partie lancée, et ça évite que d'anciens ready
+            traînent quand on reviendra en LOBBY après un END)
+        """
+        assert self.can_start(), "start_game() appelé alors que can_start() est faux"
+
+        # Tri alphabétique : déterministe et lisible à la démo.
+        # Important : on fige l'ordre maintenant et on n'y touche plus
+        # de toute la partie (la rotation des albums en dépend).
+        self.players_order = sorted(self.online_players)
+        self.total_rounds = total_rounds_for_players(len(self.players_order))
+        self.round_n = 0
+        self.phase = Phase.WRITE
+        self.deadline_ts = int(time.time()) + DURATION_WRITE_S
+        self.ready_players.clear()
