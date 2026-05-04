@@ -23,13 +23,26 @@ Responsabilités à l'étape 2 :
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from typing import Any, Dict
 
 from shared import topics
 from shared.mqtt_client import GarticMqttClient
-from shared.protocol import Phase, PresenceStatus, MIN_PLAYERS
+from shared.protocol import (
+    Phase,
+    PresenceStatus,
+    MIN_PLAYERS,
+    SubmissionType,
+    FALLBACK_WORDS,
+    round_kind,
+    duration_for_phase,
+)
+from shared.rotation import (
+    album_assigned_to_player,
+    album_id_for_index,
+)
 
 from server.room_controller import RoomController
 
@@ -450,6 +463,26 @@ class ServerApp:
         # Clear de reveal/current (peut ne pas exister mais clear est
         # idempotent : si rien n'était retained, ça ne fait rien).
         self.mqtt.clear_retained(topics.t_reveal_current(room_id))
+
+        # Étape 4 : clear des retained albums et submissions.
+        # On utilise players_order si disponible (partie démarrée) ou
+        # seen_players en fallback. On efface tous les rounds possibles
+        # (0 .. total_rounds-1) et toutes les combinaisons album/round.
+        # Si la partie n'a jamais démarré (total_rounds=0), il n'y a
+        # ni albums ni submissions à effacer (les boucles ne tournent pas).
+        if room.total_rounds > 0:
+            for round_n in range(room.total_rounds):
+                # Submissions de ce round, un par joueur de players_order.
+                for pseudo in room.players_order:
+                    self.mqtt.clear_retained(
+                        topics.t_submission(room_id, round_n, pseudo)
+                    )
+                # Albums de ce round. Il y a autant d'albums que de joueurs.
+                for i in range(len(room.players_order)):
+                    album_id = f"A{i}"
+                    self.mqtt.clear_retained(
+                        topics.t_album(room_id, album_id, round_n)
+                    )
 
         # Republie l'index sans cette room.
         self._publish_rooms_index()
@@ -915,16 +948,17 @@ class ServerApp:
     def _on_round_timer_expired(self, room_id: str, round_n: int) -> None:
         """Callback exécuté à l'expiration du timer de round.
 
-        À l'étape 3 : NO-OP. On log juste pour confirmer que le câblage
-        marche. À l'étape 4 ce callback déclenchera la consolidation
-        (collecte des soumissions + rotation + publication albums +
-        transition vers round suivant ou phase REVEAL).
+        Déclenche la consolidation du round (collecte des soumissions
+        manquantes via placeholder, construction des albums, publish
+        retained) puis la transition : round suivant ou REVEAL.
 
         Avant d'agir, on vérifie que la room existe encore et que le
         round indiqué correspond bien au round courant : un timer en
         retard sur une room déjà passée à un round suivant ne doit pas
-        re-déclencher de consolidation. (Ne devrait pas arriver en flux
-        normal grâce à _arm_round_timer.cancel(), mais robustesse.)
+        re-déclencher de consolidation. Ce cas peut arriver après un
+        early exit (le timer est annulé mais peut quand même se
+        déclencher si l'expiration est imminente — cancel() ne tue pas
+        un thread déjà sorti du sleep).
         """
         # On retire le timer du dico : il a fait son office.
         self._round_timers.pop(room_id, None)
@@ -946,11 +980,8 @@ class ServerApp:
             )
             return
 
-        # ÉTAPE 3 : on s'arrête ici. La logique réelle viendra en étape 4.
-        log.info(
-            "[%s] Timer round %d expiré (no-op étape 3, sera branché en étape 4)",
-            room_id, round_n,
-        )
+        log.info("[%s] Timer round %d expiré, consolidation", room_id, round_n)
+        self._consolidate_and_advance(room, deadline_reached=True)
 
     def _on_player_submission(
         self,
@@ -958,7 +989,29 @@ class ServerApp:
         payload: Any,
         retain: bool,
     ) -> None:
-        """Soumission d'un joueur (étape 4)."""
+        """Soumission d'un joueur pour un round donné (étape 4).
+
+        Format topic : <PREFIX>/rooms/<room_id>/submissions/round/<n>/<pseudo>
+        Format payload : SentenceSubmissionPayload ou DrawingSubmissionPayload
+                         (cf shared/schemas.py).
+
+        Politique :
+          - Validation minimale (room_id, round_n, pseudo extractibles).
+          - Si la room n'existe pas → retained orphelin, on l'efface.
+          - Si on n'est pas en phase de partie (LOBBY/REVEAL/END) → on
+            ignore (retained obsolète d'une partie précédente). Pas de
+            clear ici car les retained submission seront effacés à
+            advance_round() / fin de partie.
+          - Si payload mal formé → warning et ignore.
+          - Si add_submission retourne True (nouveauté) ET que toutes
+            les soumissions sont reçues → EARLY EXIT : on consolide tout
+            de suite sans attendre la deadline.
+
+        IMPORTANT pour la reprise après crash : ce handler reçoit aussi
+        les retained submission des rounds passés. Le RoomController
+        ignore les soumissions hors du round courant (cf add_submission),
+        donc pas de risque de pollution.
+        """
         # Format : <PREFIX>/rooms/<room_id>/submissions/round/<n>/<pseudo>
         parts = topic.split("/")
         try:
@@ -968,11 +1021,293 @@ class ServerApp:
         except (IndexError, ValueError):
             log.warning("Topic submission mal formé : %s", topic)
             return
-        sub_type = payload.get("type") if isinstance(payload, dict) else None
+
+        # Payload vide = clear retained (effacement par advance_round par ex).
+        if payload is None:
+            log.debug("submission vide (clear retained) sur %s — ignoré", topic)
+            return
+
+        if not isinstance(payload, dict):
+            log.warning("submission avec payload non-dict : topic=%s", topic)
+            return
+
+        # Validation du type. On accepte tout ce qui matche le schema :
+        # type ∈ {sentence, drawing} + champ "content" ou "strokes".
+        sub_type = payload.get("type")
+        if sub_type not in (SubmissionType.SENTENCE.value,
+                            SubmissionType.DRAWING.value):
+            log.warning(
+                "[%s] submission avec type invalide (%r) — ignoré",
+                room_id, sub_type,
+            )
+            return
+
+        # Recherche de la room cible.
+        with self._rooms_lock:
+            room = self.rooms.get(room_id)
+
+        if room is None:
+            # Retained submission orphelin d'une room déjà supprimée.
+            log.info(
+                "submission reçue pour room inconnue %s, effacement du retained",
+                room_id,
+            )
+            self.mqtt.clear_retained(topic)
+            return
+
+        # On n'accepte des soumissions que pendant les phases jouables.
+        # Un retained submission d'une partie précédente (LOBBY après
+        # un END) doit être ignoré silencieusement.
+        if room.phase not in (Phase.WRITE, Phase.DRAW, Phase.GUESS):
+            log.debug(
+                "[%s] submission ignorée (phase=%s)",
+                room_id, room.phase.value,
+            )
+            return
+
+        # Enregistrement dans le RoomController.
+        is_new = room.add_submission(round_n, pseudo, payload)
+        if not is_new:
+            # Soit c'est un doublon (ré-écrit silencieusement), soit le
+            # round n'est pas le round courant, soit le pseudo n'est
+            # pas dans players_order. Dans tous ces cas, rien à faire.
+            log.debug(
+                "[%s] submission round=%d %s (par %s) sans effet",
+                room_id, round_n, sub_type, pseudo,
+            )
+            return
+
+        n_received = len(room.submissions.get(round_n, {}))
+        n_expected = len(room.players_order)
         log.info(
-            "[%s] submission round=%d %s (par %s, retain=%s)",
-            room_id, round_n, sub_type, pseudo, retain,
+            "[%s] submission round=%d %s par %s (%d/%d)",
+            room_id, round_n, sub_type, pseudo, n_received, n_expected,
         )
+
+        # EARLY EXIT : si toutes les soumissions sont reçues, consolide
+        # immédiatement plutôt que d'attendre la deadline. C'est plus
+        # confortable pour les joueurs : pas d'attente inutile.
+        if room.has_all_submissions(round_n):
+            log.info(
+                "[%s] Toutes les soumissions reçues pour round %d → consolidation immédiate",
+                room_id, round_n,
+            )
+            self._consolidate_and_advance(room, deadline_reached=False)
+
+    # ------------------------------------------------------------------
+    # Consolidation des albums + progression de round (étape 4)
+    # ------------------------------------------------------------------
+
+    def _consolidate_and_advance(
+        self,
+        room: RoomController,
+        deadline_reached: bool,
+    ) -> None:
+        """Consolide le round courant et fait progresser la partie.
+
+        Étapes :
+          1. Annule le timer en cours (s'il existe encore : early exit).
+          2. Comble les soumissions manquantes avec un placeholder
+             (cf _make_placeholder_payload). Sécurité : en flux normal
+             le client envoie toujours, mais un crash en plein round
+             peut laisser un trou.
+          3. Construit les albums via la rotation (cf shared/rotation.py)
+             et publie chaque entrée d'album en retained.
+          4. Décide : round suivant (advance_round + republish state +
+             arme nouveau timer) OU fin de partie (REVEAL).
+
+        Cette méthode peut être appelée :
+          - Depuis _on_round_timer_expired (deadline atteinte).
+          - Depuis _on_player_submission (early exit, toutes reçues).
+
+        Elle est censée être appelée AU MAX une fois par round : le
+        timer est annulé en (1) pour éviter une double consolidation
+        si la deadline tombe juste après l'early exit.
+        """
+        room_id = room.room_id
+        round_n = room.round_n
+
+        # 1) Annule le timer en cours (cas early exit principalement).
+        timer = self._round_timers.pop(room_id, None)
+        if timer is not None:
+            timer.cancel()
+
+        # 2) Comble les soumissions manquantes côté serveur.
+        missing = room.missing_submitters(round_n)
+        if missing:
+            log.warning(
+                "[%s] Round %d : %d soumission(s) manquante(s) à la consolidation : %s",
+                room_id, round_n, len(missing), missing,
+            )
+            for pseudo in missing:
+                placeholder = self._make_placeholder_payload(round_n, pseudo)
+                room.add_submission(round_n, pseudo, placeholder)
+                # On publie aussi le placeholder en retained sur le topic
+                # de soumission. Comme ça si un client se reconnecte
+                # plus tard et regarde les retained, il voit ce qui a
+                # été pris en compte par le serveur (utile pour debug
+                # à la soutenance, et pour la cohérence).
+                self.mqtt.publish_json(
+                    topics.t_submission(room_id, round_n, pseudo),
+                    placeholder,
+                    qos=1,
+                    retain=True,
+                )
+
+        # 3) Construction et publication des albums du round courant.
+        self._publish_albums_for_round(room, round_n)
+
+        # 4) Transition : round suivant ou fin de partie.
+        if room.is_game_finished():
+            log.info("[%s] Dernier round terminé → transition vers REVEAL", room_id)
+            room.enter_reveal_phase()
+            # Étape 4 : on publie juste le state à REVEAL. L'étape 6
+            # implémentera le défilement (timer reveal + reveal/current).
+            # Note : on ne nettoie PAS les retained submission à la fin
+            # de partie, ils seront utiles pour les clients qui
+            # voudraient les inspecter pendant REVEAL ; ils seront
+            # effacés à la suppression de la room (_delete_room).
+            self._publish_room_state(room)
+            self._publish_rooms_index()
+            return
+
+        # Round suivant.
+        room.advance_round()
+        # Nettoyage des retained submission du round qu'on vient de
+        # finir : ils ne servent plus, et leur présence pollue le broker.
+        # IMPORTANT : on n'efface PAS submissions du round dans
+        # room.submissions (Python-side) car on en a encore besoin si
+        # un retained obsolète arrive après. Les retained MQTT, eux,
+        # sont effacés.
+        prev_round = room.round_n - 1
+        for pseudo in room.players_order:
+            self.mqtt.clear_retained(
+                topics.t_submission(room_id, prev_round, pseudo)
+            )
+
+        log.info(
+            "[%s] Round %d (%s) démarré, deadline dans %ds",
+            room_id, room.round_n, room.phase.value,
+            room.deadline_ts - int(time.time()),
+        )
+        self._publish_room_state(room)
+        self._publish_rooms_index()
+
+        # Arme le timer pour le nouveau round.
+        remaining_s = max(0.0, room.deadline_ts - time.time())
+        self._arm_round_timer(room_id, room.round_n, remaining_s)
+
+    def _publish_albums_for_round(
+        self,
+        room: RoomController,
+        round_n: int,
+    ) -> None:
+        """Construit et publie les entrées d'album pour ce round.
+
+        Pour chaque joueur de players_order, on calcule sur quel album
+        il a travaillé via la rotation (cf shared/rotation.py:
+        album_assigned_to_player). Sa soumission devient l'entrée de
+        cet album pour ce round.
+
+        Exemple à 3 joueurs [alice, bob, charlie] au round 1 :
+          - alice a dessiné l'album A2 (auteur initial: charlie)
+          - bob a dessiné l'album A0 (auteur initial: alice)
+          - charlie a dessiné l'album A1 (auteur initial: bob)
+
+        Donc les retained publiés sont :
+          - albums/A2/round/1 (contributed_by alice, original_author charlie)
+          - albums/A0/round/1 (contributed_by bob, original_author alice)
+          - albums/A1/round/1 (contributed_by charlie, original_author bob)
+        """
+        round_subs = room.submissions.get(round_n, {})
+
+        for pseudo in room.players_order:
+            album_id = album_assigned_to_player(
+                pseudo, round_n, room.players_order,
+            )
+            # original_author = celui dont l'album porte le numéro.
+            # album_id est de la forme "A<index>", et players_order[index]
+            # est l'auteur initial.
+            author_index = int(album_id[1:])
+            original_author = room.players_order[author_index]
+
+            submission = round_subs.get(pseudo)
+            if submission is None:
+                # Sécurité : ne devrait pas arriver après le combling
+                # placeholder, mais on log et on skip pour ne pas crash.
+                log.error(
+                    "[%s] Pas de soumission pour %s round %d à la consolidation",
+                    room.room_id, pseudo, round_n,
+                )
+                continue
+
+            # On construit l'entrée d'album à partir de la soumission.
+            # Le format dépend du type (sentence / drawing).
+            sub_type = submission.get("type")
+            entry: dict = {
+                "album_id": album_id,
+                "round": round_n,
+                "type": sub_type,
+                "contributed_by": pseudo,
+                "original_author": original_author,
+            }
+            if sub_type == SubmissionType.SENTENCE.value:
+                entry["content"] = submission.get("content", "")
+            elif sub_type == SubmissionType.DRAWING.value:
+                entry["strokes"] = submission.get("strokes", [])
+                entry["canvas_size"] = submission.get("canvas_size", [800, 600])
+            else:
+                log.error(
+                    "[%s] Type de soumission inconnu (%r) pour %s round %d",
+                    room.room_id, sub_type, pseudo, round_n,
+                )
+                continue
+
+            self.mqtt.publish_json(
+                topics.t_album(room.room_id, album_id, round_n),
+                entry,
+                qos=1,
+                retain=True,
+            )
+            log.info(
+                "[%s] Album %s round=%d publié (par %s, original=%s, type=%s)",
+                room.room_id, album_id, round_n, pseudo, original_author, sub_type,
+            )
+
+    def _make_placeholder_payload(self, round_n: int, pseudo: str) -> dict:
+        """Construit une soumission de remplacement pour un joueur absent.
+
+        Type de placeholder selon la phase :
+          - round pair (WRITE/GUESS) : sentence avec un mot piochés
+            au hasard dans FALLBACK_WORDS (cf shared/protocol.py).
+          - round impair (DRAW) : drawing avec strokes vides.
+            Le client affichera un dessin vide, c'est volontaire (ça
+            indique visuellement qu'un joueur n'a pas fait de dessin).
+
+        ts est mis à 0 pour signaler "non publié par le joueur".
+        author est mis au pseudo du joueur absent (pour traçabilité).
+        """
+        kind = round_kind(round_n)
+        if kind == SubmissionType.SENTENCE:
+            # On pioche un mot au hasard pour rester dans l'esprit
+            # Gartic (placeholders absurdes plutôt qu'un message d'erreur).
+            content = random.choice(FALLBACK_WORDS)
+            return {
+                "type": SubmissionType.SENTENCE.value,
+                "round": round_n,
+                "author": pseudo,
+                "ts": 0,
+                "content": content,
+            }
+        else:
+            return {
+                "type": SubmissionType.DRAWING.value,
+                "round": round_n,
+                "author": pseudo,
+                "ts": 0,
+                "strokes": [],
+                "canvas_size": [600, 400],
+            }
 
     # ------------------------------------------------------------------
     # Helpers

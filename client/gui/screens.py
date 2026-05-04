@@ -122,13 +122,21 @@ class LobbyScreen(tk.Frame):
         tk.Label(self, text=f"ID secret : {self.app.state.room_id}", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50").pack(pady=0)
         tk.Label(self, text=f"Connecté : {self.app.state.pseudo}", font=("Arial", 12), fg="lightgray", bg="#2C3E50").pack(pady=5)
 
-        self.players_label = tk.Label(self, text="Joueurs en ligne :\n- " + self.app.state.pseudo, font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
-        self.players_label.pack(pady=20)
+        self.ready_count_label = tk.Label(self, text="", font=("Arial", 14, "bold"), fg="#2ECC71", bg="#2C3E50")
+        self.ready_count_label.pack(pady=10)
+        
+        self.min_players_warning = tk.Label(self, text="", font=("Arial", 10, "italic"), fg="#E74C3C", bg="#2C3E50")
+        self.min_players_warning.pack(pady=0)
+
+        self.players_label = tk.Label(self, text="", font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
+        self.players_label.pack(pady=10)
 
         self.ready_btn = tk.Button(self, text="Je suis prêt !", font=("Arial", 14, "bold"), bg="#E67E22", fg="white", command=self.toggle_ready)
         self.ready_btn.pack(pady=10)
 
         tk.Button(self, text="Quitter la salle", font=("Arial", 12), bg="#C0392B", fg="white", command=self.leave_room).pack(pady=20)
+        
+        self.update_players_list()
 
     def toggle_ready(self):
         self.app.state.is_ready = not self.app.state.is_ready
@@ -147,20 +155,38 @@ class LobbyScreen(tk.Frame):
         self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
 
     def leave_room(self):
-        topic = topics.t_player_presence(self.app.state.room_id, self.app.state.pseudo)
-        self.app.net.client.publish_json(topic, {"status": "offline", "pseudo": self.app.state.pseudo, "ts": int(time.time())}, retain=True)
+        topic_presence = topics.t_player_presence(self.app.state.room_id, self.app.state.pseudo)
+        self.app.net.client.publish_json(topic_presence, {"status": "offline", "pseudo": self.app.state.pseudo, "ts": int(time.time())}, retain=True)
         
+        topic_ready = topics.t_player_ready(self.app.state.room_id, self.app.state.pseudo)
+        self.app.net.client.publish_json(topic_ready, {"ready": False, "pseudo": self.app.state.pseudo, "ts": int(time.time())}, retain=True)
+
         self.app.state.is_ready = False
         self.app.state.players = []
+        self.app.state.ready_players = []
         
+        self.after(300, self._execute_leave)
+
+    def _execute_leave(self):
         self.app.net.connect_menu()
         self.app.show_screen("MENU")
 
     def update_players_list(self):
         text = "Joueur(s) en ligne :\n"
         for p in self.app.state.players:
-            text += f"- {p}\n"
+            status = "✅" if p in self.app.state.ready_players else "⏳"
+            text += f"- {p} {status}\n"
         self.players_label.config(text=text)
+
+        total = len(self.app.state.players)
+        ready = len([p for p in self.app.state.players if p in self.app.state.ready_players])
+        
+        if total < 3:
+            self.ready_count_label.config(text=f"{ready} / 3 joueurs prêts", fg="#F1C40F")
+            self.min_players_warning.config(text="(Minimum 3 joueurs requis pour démarrer)")
+        else:
+            self.ready_count_label.config(text=f"{ready} / {total} joueurs prêts", fg="#2ECC71")
+            self.min_players_warning.config(text="")
 
 
 class DrawScreen(tk.Frame):
@@ -285,7 +311,12 @@ class WriteScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="Phase d'Écriture", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=40)
+        round_n = getattr(self.app.state, "round", 0)
+        tk.Label(self, text=f"Phase d'Écriture - Round {round_n}", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
+        
+        self.timer_label = tk.Label(self, text="Temps restant : --", font=("Arial", 20, "bold"), fg="#E74C3C", bg="#2C3E50")
+        self.timer_label.pack(pady=10)
+
         tk.Label(self, text="Invente une phrase drôle ou absurde :", font=("Arial", 16), fg="lightgray", bg="#2C3E50").pack(pady=10)
 
         self.sentence_entry = tk.Entry(self, font=("Arial", 16), width=40, justify="center")
@@ -297,10 +328,30 @@ class WriteScreen(tk.Frame):
         self.status_label = tk.Label(self, text="", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50")
         self.status_label.pack(pady=10)
 
+        self.submitted = False
+        self.update_timer()
+
+    def update_timer(self):
+        if not self.winfo_exists():
+            return
+            
+        rem = self.app.state.deadline_ts - int(time.time())
+        if rem <= 0:
+            self.timer_label.config(text="Temps écoulé !")
+            if not self.submitted:
+                self.submit_sentence()
+        else:
+            self.timer_label.config(text=f"Temps restant : {rem}s")
+            self.after(1000, self.update_timer)
+
     def submit_sentence(self):
+        if self.submitted:
+            return
+            
+        self.submitted = True
         content = self.sentence_entry.get().strip()
         if not content:
-            return
+            content = "[Pas d'inspiration]"
 
         payload = {
             "type": "sentence",
@@ -314,7 +365,7 @@ class WriteScreen(tk.Frame):
 
         if self.app.net.client:
             self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
-            
+
         self.sentence_entry.config(state="disabled")
         self.submit_btn.config(state="disabled")
         self.status_label.config(text="Phrase envoyée ! En attente des autres...")

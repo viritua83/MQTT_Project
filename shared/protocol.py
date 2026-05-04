@@ -63,6 +63,33 @@ KEEPALIVE_S = 10  # Court : permet au broker de détecter un crash en ~15s max
 
 
 # ---------------------------------------------------------------------------
+# Liste de mots pour placeholders serveur (étape 4)
+# ---------------------------------------------------------------------------
+#
+# Utilisée par le serveur UNIQUEMENT comme ceinture de sécurité quand un
+# client crash en plein round et n'envoie pas de soumission à temps. En
+# conditions normales, le client publie toujours une soumission (même
+# vide) à la deadline (cf WriteScreen.update_timer côté client). Donc le
+# serveur ne pioche dans cette liste que pour les soumissions
+# strictement absentes à la deadline.
+#
+# Les mots sont volontairement absurdes pour rester dans l'esprit Gartic
+# Phone et donner du sens au reveal final.
+FALLBACK_WORDS = [
+    "un canard motorisé",
+    "une banane qui parle",
+    "un chat astronaute",
+    "une licorne en colère",
+    "un robot poète",
+    "un dragon qui tricote",
+    "une pizza volante",
+    "un piano enchanté",
+    "un panda ninja",
+    "une baleine sur un vélo",
+]
+
+
+# ---------------------------------------------------------------------------
 # Helpers de payload
 # ---------------------------------------------------------------------------
 

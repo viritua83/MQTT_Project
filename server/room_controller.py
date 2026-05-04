@@ -22,15 +22,23 @@ les transitions à l'oral lors de la soutenance.
     utilisée par le ServerApp pour effacer les retained presence/<pseudo>
     au moment de la suppression de la room.
 
-Étape 3 (cette version) :
+Étape 3 :
   - ready_players : ensemble des joueurs ayant cliqué "prêt".
   - set_ready(pseudo, ready) : met à jour le set ready.
   - can_start() : True si on peut démarrer (>= MIN_PLAYERS et tous prêts).
   - start_game() : transition LOBBY -> WRITE, fige players_order, calcule
     total_rounds et deadline_ts.
 
+Étape 4 (cette version) :
+  - submissions : dict[round_n][pseudo] -> payload, mémorise toutes les
+    soumissions du round courant.
+  - add_submission(round_n, pseudo, payload) : enregistre.
+  - has_all_submissions(round_n) : True si tous les joueurs (online ET
+    présents dans players_order) ont soumis pour ce round.
+  - advance_round() : passe au round suivant ou termine la partie.
+  - is_game_finished() : True après le dernier round.
+
 Étapes suivantes (préparées dans la structure mais pas implémentées) :
-  - 4 : collecte des soumissions + transitions de rounds.
   - 6 : phase REVEAL + retour au LOBBY.
 """
 from __future__ import annotations
@@ -42,6 +50,8 @@ from shared.protocol import (
     Phase,
     MIN_PLAYERS,
     DURATION_WRITE_S,
+    phase_for_round,
+    duration_for_phase,
 )
 from shared.rotation import total_rounds_for_players
 
@@ -77,6 +87,13 @@ class RoomController:
     # Un joueur qui se déconnecte est automatiquement retiré de ce set
     # via remove_player() (un joueur offline ne peut pas être prêt).
     ready_players: set[str] = field(default_factory=set)
+
+    # Soumissions reçues par round (étape 4).
+    # Structure : {round_n: {pseudo: payload_dict}}.
+    # On stocke le payload tel que reçu (sentence ou drawing) car on en
+    # a besoin pour construire les albums lors de la consolidation.
+    # Vidé au démarrage de chaque round dans advance_round().
+    submissions: dict[int, dict[str, dict]] = field(default_factory=dict)
 
     # Mémoire de TOUS les pseudos qui ont publié au moins une fois
     # dans cette room (online ou offline). Sert au moment de la
@@ -272,3 +289,135 @@ class RoomController:
         self.phase = Phase.WRITE
         self.deadline_ts = int(time.time()) + DURATION_WRITE_S
         self.ready_players.clear()
+        # Initialise le dict du round courant (vide pour l'instant).
+        self.submissions = {0: {}}
+
+    # ---------------------------------------------------------------
+    # Système soumissions + progression de round (étape 4)
+    # ---------------------------------------------------------------
+
+    def add_submission(
+        self,
+        round_n: int,
+        pseudo: str,
+        payload: dict,
+    ) -> bool:
+        """Enregistre la soumission d'un joueur pour un round donné.
+
+        Retourne True si c'est une nouvelle soumission (pas un doublon).
+        Le ServerApp s'en sert pour décider s'il faut tester
+        has_all_submissions() (early exit) — pas la peine de tester si
+        rien n'a changé (même soumission renvoyée par exemple).
+
+        Politique :
+          - Si le round indiqué n'est pas le round courant, on ignore.
+            Ça peut arriver avec un retained submission obsolète d'un
+            round précédent qui arrive après une reconnexion. Le
+            ServerApp aura nettoyé les retained par advance_round() →
+            clear, mais on est défensif.
+          - Si le pseudo n'est pas dans players_order, on ignore. Un
+            joueur qui aurait rejoint après le démarrage ne participe
+            pas (cas qui ne devrait pas arriver vu que la phase passe
+            en WRITE → la GUI ne montre plus la room dans l'index, mais
+            on est défensif).
+          - Si le joueur a déjà soumis pour ce round, on écrase. Ça
+            permet aux clients de se "rétracter" (rare, mais pas grave).
+            Et ça évite qu'un retained republié par le client à la
+            reconnexion crée un doublon.
+        """
+        if round_n != self.round_n:
+            return False
+        if pseudo not in self.players_order:
+            return False
+
+        # On garantit que le sous-dict existe (start_game et
+        # advance_round l'ont normalement déjà créé).
+        if round_n not in self.submissions:
+            self.submissions[round_n] = {}
+
+        was_new = pseudo not in self.submissions[round_n]
+        self.submissions[round_n][pseudo] = payload
+        return was_new
+
+    def has_all_submissions(self, round_n: int) -> bool:
+        """True si tous les joueurs de players_order ont soumis pour ce round.
+
+        Note : on se base sur players_order (figé au démarrage), pas sur
+        online_players. Si un joueur se déconnecte en plein round, on
+        attend quand même sa soumission jusqu'à la deadline. À la
+        deadline, le ServerApp comblera les manquants avec un
+        placeholder serveur (cf FALLBACK_WORDS).
+        """
+        if round_n not in self.submissions:
+            return False
+        return len(self.submissions[round_n]) >= len(self.players_order)
+
+    def missing_submitters(self, round_n: int) -> list[str]:
+        """Liste des joueurs (de players_order) qui n'ont pas soumis ce round.
+
+        Utilisée par le ServerApp à la deadline pour générer un
+        placeholder pour chaque joueur manquant avant de consolider.
+        """
+        if round_n not in self.submissions:
+            return list(self.players_order)
+        submitted = set(self.submissions[round_n].keys())
+        return [p for p in self.players_order if p not in submitted]
+
+    def advance_round(self) -> None:
+        """Passe au round suivant. Met à jour phase, round_n, deadline_ts.
+
+        Précondition : on est en cours de partie (phase != LOBBY) et
+        on n'est pas déjà au dernier round. Le ServerApp doit vérifier
+        is_game_finished() AVANT d'appeler cette méthode.
+
+        La phase suivante est calculée par phase_for_round() :
+          - round 0   -> WRITE
+          - round impair -> DRAW (dessine la phrase)
+          - round pair (>=2) -> GUESS (devine le dessin)
+
+        La deadline est recalculée à partir de duration_for_phase()
+        pour la nouvelle phase. Ça permet d'avoir des durées différentes
+        par phase sans complexifier ici (cf shared/protocol.py).
+
+        Le dict des soumissions du round précédent est conservé tel quel :
+        le ServerApp s'en est servi pour la consolidation des albums.
+        On crée un sous-dict vide pour le nouveau round.
+        """
+        assert self.phase in (Phase.WRITE, Phase.DRAW, Phase.GUESS), \
+            f"advance_round() en phase invalide : {self.phase}"
+        assert not self.is_game_finished(), \
+            "advance_round() appelé après le dernier round"
+
+        self.round_n += 1
+        self.phase = phase_for_round(self.round_n)
+        self.deadline_ts = int(time.time()) + duration_for_phase(self.phase)
+        self.submissions[self.round_n] = {}
+
+    def is_game_finished(self) -> bool:
+        """True si on vient de finir le dernier round.
+
+        Le dernier round joué est total_rounds - 1 (rounds indexés 0..N-1).
+        Donc si round_n == total_rounds - 1, on a fini la partie.
+
+        Utilisé par le ServerApp APRÈS la consolidation du round courant
+        pour décider : transition vers REVEAL (dernier round fini) ou
+        advance_round() (round suivant à jouer).
+        """
+        if self.total_rounds == 0:
+            # Sécurité : pas de partie en cours.
+            return False
+        return self.round_n >= self.total_rounds - 1
+
+    def enter_reveal_phase(self) -> None:
+        """Transition vers la phase REVEAL (étape 6, simplifié ici).
+
+        À l'étape 4, on se contente de passer la phase à REVEAL et
+        d'effacer la deadline (pas de timer en REVEAL pour l'instant).
+        L'étape 6 implémentera le défilement des albums.
+
+        Précondition : is_game_finished() doit être vrai.
+        """
+        assert self.is_game_finished(), \
+            "enter_reveal_phase() appelée alors que la partie n'est pas finie"
+        self.phase = Phase.REVEAL
+        self.deadline_ts = 0
