@@ -11,7 +11,6 @@ class NetworkManager:
     def connect_menu(self):
         if self.client:
             self.client.disconnect()
-            time.sleep(0.2)
 
         client_id = f"client-menu-{int(time.time())}"
 
@@ -42,8 +41,6 @@ class NetworkManager:
         )
 
         self.client.on_message_for(topics.sub_all_player_presence(room_id), self._on_presence)
-        self.client.on_message_for(topics.sub_all_player_ready(room_id), self._on_player_ready)
-        self.client.on_message_for(topics.sub_all_albums(room_id), self._on_album)
         self.client.on_message_for(topics.t_state(room_id), self._on_state)
 
         self.client.on_ready(self._publish_online)
@@ -79,43 +76,9 @@ class NetworkManager:
         if hasattr(self.app.current_screen, 'update_players_list'):
             self.app.after(0, self.app.current_screen.update_players_list)
 
-    def _on_player_ready(self, topic, payload, retain):
-        if not payload: return
-        pseudo = payload.get("pseudo")
-        is_ready = payload.get("ready")
-
-        if is_ready and pseudo not in self.state.ready_players:
-            self.state.ready_players.append(pseudo)
-        elif not is_ready and pseudo in self.state.ready_players:
-            self.state.ready_players.remove(pseudo)
-
-        if hasattr(self.app.current_screen, 'update_players_list'):
-            self.app.after(0, self.app.current_screen.update_players_list)
-
-    def _on_album(self, topic, payload, retain):
-        if not payload: return
-        album_id = payload.get("album_id")
-        round_n = payload.get("round")
-        
-        if album_id and round_n is not None:
-            if album_id not in self.state.albums:
-                self.state.albums[album_id] = {}
-            self.state.albums[album_id][round_n] = payload
-
     def _on_state(self, topic, payload, retain):
         if not payload: return
-        
-        self.state.phase = payload.get("phase", self.state.phase)
-        self.state.round = payload.get("round", self.state.round)
-        self.state.total_rounds = payload.get("total_rounds", self.state.total_rounds)
-        self.state.deadline_ts = payload.get("deadline_ts", self.state.deadline_ts)
-        self.state.players_order = payload.get("players_order", self.state.players_order)
-        self.state.version = payload.get("version", self.state.version)
-        
-        if hasattr(self.app, 'current_screen'):
-             current_phase = self.app.current_screen.__class__.__name__.replace("Screen", "").upper()
-             if self.state.phase != current_phase:
-                 if self.state.phase == "LOBBY" and current_phase == "MENU":
-                     pass
-                 else:
-                     self.app.after(0, lambda: self.app.show_screen(self.state.phase))
+        phase = payload.get("phase")
+        if phase and phase != self.state.phase:
+            self.state.phase = phase
+            self.app.after(0, lambda: self.app.show_screen(phase))
