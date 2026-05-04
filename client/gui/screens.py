@@ -25,13 +25,7 @@ class MenuScreen(tk.Frame):
         self.rooms_list_inner = tk.Frame(self.rooms_frame, bg="#34495E")
         self.rooms_list_inner.pack(fill="both", expand=True)
 
-        self.create_btn = tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup)
-        self.create_btn.pack(pady=10)
-
-        self.status_label = tk.Label(self, text="", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50")
-        self.status_label.pack(pady=5)
-
-        self.pending_room_id = None
+        tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup).pack(pady=20)
 
         self.update_server_status()
         self.update_rooms_list()
@@ -48,95 +42,60 @@ class MenuScreen(tk.Frame):
 
         if not self.app.state.available_rooms:
             tk.Label(self.rooms_list_inner, text="Aucune salle disponible.", font=("Arial", 12, "italic"), fg="lightgray", bg="#34495E").pack(pady=20)
-        else:
-            for room in self.app.state.available_rooms:
-                room_id = room.get("id")
-                name = room.get("name")
-                n_players = room.get("n_players")
-                phase = room.get("phase")
+            return
 
-                btn_text = f"{name} ({n_players} joueur(s)) - [{phase}]"
-                state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
-                bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
+        for room in self.app.state.available_rooms:
+            room_id = room.get("id")
+            name = room.get("name")
+            n_players = room.get("n_players")
+            phase = room.get("phase")
 
-                tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
-                          command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
+            btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
+            
+            state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
+            bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
 
-        if self.pending_room_id:
-            if any(r.get("id") == self.pending_room_id for r in self.app.state.available_rooms):
-                room_id_to_join = self.pending_room_id
-                self.pending_room_id = None 
-                pseudo = self.pseudo_entry.get().strip()
-                self.app.net.enter_room(room_id_to_join, pseudo)
-                self.app.show_screen("LOBBY")
+            tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
+                      command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
 
     def create_room_popup(self):
         pseudo = self.pseudo_entry.get().strip()
         if not pseudo:
-            self.status_label.config(text="⚠️ Choisis un pseudo d'abord !", fg="#E74C3C")
             return
 
         room_name = simpledialog.askstring("Nouvelle Salle", "Nom de la salle :", parent=self)
         if room_name:
-            self.pending_room_id = secrets.token_hex(3)
-            payload = {"room_id": self.pending_room_id, "name": room_name}
-            
-            self.create_btn.config(state="disabled")
-            self.status_label.config(text=f"⏳ Création de '{room_name}' en cours...", fg="#F1C40F")
+            room_id = secrets.token_hex(3)
+            payload = {"room_id": room_id, "name": room_name}
             
             self.app.net.client.publish_json(topics.t_rooms_create(), payload, qos=0)
-            
-            self.app.after(3000, self.check_creation_timeout)
-
-    def check_creation_timeout(self):
-        if not self.winfo_exists():
-            return
-            
-        if self.pending_room_id:
-            self.status_label.config(text="❌ Échec de la création (Le serveur n'a pas répondu).", fg="#E74C3C")
-            self.pending_room_id = None
-            self.create_btn.config(state="normal")
+            self.app.net.enter_room(room_id, pseudo)
+            self.app.show_screen("LOBBY")
 
     def join_specific_room(self, room_id):
         pseudo = self.pseudo_entry.get().strip()
         if not pseudo:
-            self.status_label.config(text="⚠️ Choisis un pseudo d'abord !", fg="#E74C3C")
             return
             
         self.app.net.enter_room(room_id, pseudo)
         self.app.show_screen("LOBBY")
 
+        
 class LobbyScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
 
-        room_name = "Inconnu"
-        for r in self.app.state.available_rooms:
-            if r.get("id") == self.app.state.room_id:
-                room_name = r.get("name")
-                break
-
-        tk.Label(self, text=f"Lobby - {room_name}", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
-        tk.Label(self, text=f"ID secret : {self.app.state.room_id}", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50").pack(pady=0)
+        tk.Label(self, text=f"Lobby - Salle : {self.app.state.room_id}", font=("Arial", 20, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
+        tk.Label(self, text="(Donne cet ID pour qu'on te rejoigne)", font=("Arial", 10, "italic"), fg="#F1C40F", bg="#2C3E50").pack(pady=0)
         tk.Label(self, text=f"Connecté : {self.app.state.pseudo}", font=("Arial", 12), fg="lightgray", bg="#2C3E50").pack(pady=5)
 
-        self.ready_count_label = tk.Label(self, text="", font=("Arial", 14, "bold"), fg="#2ECC71", bg="#2C3E50")
-        self.ready_count_label.pack(pady=10)
-        
-        self.min_players_warning = tk.Label(self, text="", font=("Arial", 10, "italic"), fg="#E74C3C", bg="#2C3E50")
-        self.min_players_warning.pack(pady=0)
-
-        self.players_label = tk.Label(self, text="", font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
-        self.players_label.pack(pady=10)
+        self.players_label = tk.Label(self, text="Joueurs en ligne :\n- " + self.app.state.pseudo, font=("Arial", 14), fg="#3498DB", bg="#2C3E50")
+        self.players_label.pack(pady=20)
 
         self.ready_btn = tk.Button(self, text="Je suis prêt !", font=("Arial", 14, "bold"), bg="#E67E22", fg="white", command=self.toggle_ready)
-        self.ready_btn.pack(pady=10)
-
-        tk.Button(self, text="Quitter la salle", font=("Arial", 12), bg="#C0392B", fg="white", command=self.leave_room).pack(pady=20)
-        
-        self.update_players_list()
+        self.ready_btn.pack(pady=30)
 
     def toggle_ready(self):
         self.app.state.is_ready = not self.app.state.is_ready
@@ -154,40 +113,11 @@ class LobbyScreen(tk.Frame):
         topic = topics.t_player_ready(self.app.state.room_id, self.app.state.pseudo)
         self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
 
-    def leave_room(self):
-        topic_presence = topics.t_player_presence(self.app.state.room_id, self.app.state.pseudo)
-        self.app.net.client.publish_json(topic_presence, {"status": "offline", "pseudo": self.app.state.pseudo, "ts": int(time.time())}, retain=True)
-        
-        topic_ready = topics.t_player_ready(self.app.state.room_id, self.app.state.pseudo)
-        self.app.net.client.publish_json(topic_ready, {"ready": False, "pseudo": self.app.state.pseudo, "ts": int(time.time())}, retain=True)
-
-        self.app.state.is_ready = False
-        self.app.state.players = []
-        self.app.state.ready_players = []
-        
-        self.after(300, self._execute_leave)
-
-    def _execute_leave(self):
-        self.app.net.connect_menu()
-        self.app.show_screen("MENU")
-
     def update_players_list(self):
-        text = "Joueur(s) en ligne :\n"
+        text = "Joueurs en ligne :\n"
         for p in self.app.state.players:
-            status = "✅" if p in self.app.state.ready_players else "⏳"
-            text += f"- {p} {status}\n"
+            text += f"- {p}\n"
         self.players_label.config(text=text)
-
-        total = len(self.app.state.players)
-        ready = len([p for p in self.app.state.players if p in self.app.state.ready_players])
-        
-        if total < 3:
-            self.ready_count_label.config(text=f"{ready} / 3 joueurs prêts", fg="#F1C40F")
-            self.min_players_warning.config(text="(Minimum 3 joueurs requis pour démarrer)")
-        else:
-            self.ready_count_label.config(text=f"{ready} / {total} joueurs prêts", fg="#2ECC71")
-            self.min_players_warning.config(text="")
-
 
 class DrawScreen(tk.Frame):
     """Écran de dessin (rounds impairs).
@@ -456,12 +386,7 @@ class WriteScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-        round_n = getattr(self.app.state, "round", 0)
-        tk.Label(self, text=f"Phase d'Écriture - Round {round_n}", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
-        
-        self.timer_label = tk.Label(self, text="Temps restant : --", font=("Arial", 20, "bold"), fg="#E74C3C", bg="#2C3E50")
-        self.timer_label.pack(pady=10)
-
+        tk.Label(self, text="Phase d'Écriture", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=40)
         tk.Label(self, text="Invente une phrase drôle ou absurde :", font=("Arial", 16), fg="lightgray", bg="#2C3E50").pack(pady=10)
 
         self.sentence_entry = tk.Entry(self, font=("Arial", 16), width=40, justify="center")
@@ -473,30 +398,10 @@ class WriteScreen(tk.Frame):
         self.status_label = tk.Label(self, text="", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50")
         self.status_label.pack(pady=10)
 
-        self.submitted = False
-        self.update_timer()
-
-    def update_timer(self):
-        if not self.winfo_exists():
-            return
-            
-        rem = self.app.state.deadline_ts - int(time.time())
-        if rem <= 0:
-            self.timer_label.config(text="Temps écoulé !")
-            if not self.submitted:
-                self.submit_sentence()
-        else:
-            self.timer_label.config(text=f"Temps restant : {rem}s")
-            self.after(1000, self.update_timer)
-
     def submit_sentence(self):
-        if self.submitted:
-            return
-            
-        self.submitted = True
         content = self.sentence_entry.get().strip()
         if not content:
-            content = "[Pas d'inspiration]"
+            return
 
         payload = {
             "type": "sentence",
@@ -510,7 +415,7 @@ class WriteScreen(tk.Frame):
 
         if self.app.net.client:
             self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
-
+            
         self.sentence_entry.config(state="disabled")
         self.submit_btn.config(state="disabled")
         self.status_label.config(text="Phrase envoyée ! En attente des autres...")
