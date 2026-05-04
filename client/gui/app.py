@@ -27,6 +27,7 @@ class GarticApp(tk.Tk):
         self.show_screen("MENU")
 
     def show_screen(self, phase):
+        print(f"[DBG show_screen] phase={phase} current={self.current_screen.__class__.__name__ if self.current_screen else 'None'}")
         if self.current_screen:
             self.current_screen.destroy()
             
