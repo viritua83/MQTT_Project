@@ -36,6 +36,7 @@ from shared.protocol import (
     MIN_PLAYERS,
     SubmissionType,
     FALLBACK_WORDS,
+    DURATION_REVEAL_STEP_S,
     round_kind,
     duration_for_phase,
 )
@@ -98,6 +99,14 @@ class ServerApp:
         # À l'étape 3 le callback du timer ne fait rien (no-op). À l'étape
         # 4 il déclenchera la consolidation des soumissions.
         self._round_timers: Dict[str, threading.Timer] = {}
+
+        # Timers de défilement REVEAL, indexés par room_id (étape 6).
+        # Distincts des _round_timers car les deux phases sont mutuellement
+        # exclusives (round_timers : WRITE/DRAW/GUESS ; reveal_timers : REVEAL).
+        # On garde des dicts séparés pour la lisibilité du code et pour
+        # éviter les bugs (par ex. un timer round qui se déclenche pendant
+        # un REVEAL parce qu'on aurait oublié de bien typer).
+        self._reveal_timers: Dict[str, threading.Timer] = {}
 
         # Configuration du client MQTT avec la LWT serveur globale.
         # Le payload de la LWT est ce que le broker publiera automatiquement
@@ -227,6 +236,11 @@ class ServerApp:
         for room_id, timer in list(self._round_timers.items()):
             timer.cancel()
         self._round_timers.clear()
+
+        # Idem pour les timers de défilement REVEAL (étape 6).
+        for room_id, timer in list(self._reveal_timers.items()):
+            timer.cancel()
+        self._reveal_timers.clear()
 
         try:
             self.mqtt.publish_json(
@@ -445,6 +459,12 @@ class ServerApp:
         if timer is not None:
             timer.cancel()
             log.info("[%s] Timer de round annulé (suppression room)", room_id)
+
+        # Idem pour le timer reveal (étape 6).
+        reveal_timer = self._reveal_timers.pop(room_id, None)
+        if reveal_timer is not None:
+            reveal_timer.cancel()
+            log.info("[%s] Timer reveal annulé (suppression room)", room_id)
 
         log.info(
             "[%s] Suppression de la room (joueurs vus : %d)",
@@ -1171,14 +1191,17 @@ class ServerApp:
         if room.is_game_finished():
             log.info("[%s] Dernier round terminé → transition vers REVEAL", room_id)
             room.enter_reveal_phase()
-            # Étape 4 : on publie juste le state à REVEAL. L'étape 6
-            # implémentera le défilement (timer reveal + reveal/current).
             # Note : on ne nettoie PAS les retained submission à la fin
             # de partie, ils seront utiles pour les clients qui
             # voudraient les inspecter pendant REVEAL ; ils seront
             # effacés à la suppression de la room (_delete_room).
             self._publish_room_state(room)
             self._publish_rooms_index()
+            # Étape 6 : démarre le défilement REVEAL.
+            # On publie immédiatement la première étape (album A0,
+            # step 0) puis on arme un timer pour la suivante.
+            self._publish_reveal_current(room)
+            self._arm_reveal_timer(room.room_id)
             return
 
         # Round suivant.
@@ -1342,6 +1365,115 @@ class ServerApp:
             payload["left"] = True
 
         return payload
+
+    # ------------------------------------------------------------------
+    # Défilement REVEAL (étape 6)
+    # ------------------------------------------------------------------
+
+    def _publish_reveal_current(self, room: RoomController) -> None:
+        """Publie le retained reveal/current avec la position courante.
+
+        Format : {album_id, step, total_steps, finished} (cf
+        shared/schemas.py:RevealPayload).
+
+        Le client RevealScreen lit ce retained pour savoir quel album
+        et quelle étape afficher. Les entries d'album elles-mêmes sont
+        déjà publiées (étape 4) dans rooms/<id>/albums/<album_id>/round/<n>.
+        """
+        payload = room.to_reveal_payload()
+        self.mqtt.publish_json(
+            topics.t_reveal_current(room.room_id),
+            payload,
+            qos=1,
+            retain=True,
+        )
+        log.info(
+            "[%s] reveal/current publié : album=%s step=%d/%d finished=%s",
+            room.room_id, payload["album_id"], payload["step"],
+            payload["total_steps"], payload["finished"],
+        )
+
+    def _arm_reveal_timer(self, room_id: str) -> None:
+        """Arme un threading.Timer pour avancer d'une étape de défilement.
+
+        Le délai est DURATION_REVEAL_STEP_S (3s par défaut). À chaque
+        expiration, _on_reveal_timer_expired sera appelé : il avance
+        d'une étape, publie le nouveau reveal/current, et réarme un
+        nouveau timer (sauf si le défilement est terminé).
+
+        Si un timer reveal était déjà actif pour cette room, on l'annule
+        avant d'en armer un nouveau. Ce cas ne devrait pas arriver en
+        flux normal, c'est une sécurité.
+        """
+        previous = self._reveal_timers.pop(room_id, None)
+        if previous is not None:
+            previous.cancel()
+
+        timer = threading.Timer(
+            DURATION_REVEAL_STEP_S,
+            self._on_reveal_timer_expired,
+            args=(room_id,),
+        )
+        timer.name = f"reveal-timer-{room_id}"
+        timer.daemon = True
+        self._reveal_timers[room_id] = timer
+        timer.start()
+
+    def _on_reveal_timer_expired(self, room_id: str) -> None:
+        """Callback exécuté à l'expiration du timer de défilement.
+
+        Logique :
+          1. Vérifie que la room existe encore et est bien en phase
+             REVEAL. Si ce n'est plus le cas (room supprimée, ou phase
+             changée pour une raison étrange), on log et on s'arrête.
+          2. Si le défilement était déjà fini (cas pathologique), on
+             s'arrête aussi.
+          3. Sinon, on avance d'une étape (advance_reveal()), on publie
+             le nouveau reveal/current.
+          4. Si le défilement vient juste de se terminer (reveal_finished
+             passé à True dans cet appel), on n'arme PAS de nouveau
+             timer : c'est la fin. Les clients verront le retained
+             finished=True et géreront le retour au menu après leurs
+             5 secondes côté GUI (cf décision Q4 étape 6).
+          5. Sinon, on arme un nouveau timer pour la prochaine étape.
+        """
+        # Retire le timer du dict : il a fait son office.
+        self._reveal_timers.pop(room_id, None)
+
+        with self._rooms_lock:
+            room = self.rooms.get(room_id)
+
+        if room is None:
+            log.debug(
+                "Timer reveal expiré pour room %s déjà supprimée — ignoré",
+                room_id,
+            )
+            return
+
+        if room.phase != Phase.REVEAL:
+            log.debug(
+                "[%s] Timer reveal expiré mais phase=%s — ignoré",
+                room_id, room.phase.value,
+            )
+            return
+
+        if room.reveal_finished:
+            # Ne devrait pas arriver (on n'arme pas de timer après finished),
+            # mais robustesse.
+            log.debug("[%s] Timer reveal expiré mais déjà finished", room_id)
+            return
+
+        # Avance d'une étape.
+        room.advance_reveal()
+        self._publish_reveal_current(room)
+
+        # Réarme uniquement si pas fini. Le dernier publish (avec
+        # finished=True) reste retained sur le broker ; les clients
+        # qui se connectent après verront que la partie est terminée.
+        if not room.reveal_finished:
+            self._arm_reveal_timer(room_id)
+        else:
+            log.info("[%s] Défilement REVEAL terminé", room_id)
 
     # ------------------------------------------------------------------
     # Helpers

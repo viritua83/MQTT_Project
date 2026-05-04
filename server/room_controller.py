@@ -29,7 +29,7 @@ les transitions à l'oral lors de la soutenance.
   - start_game() : transition LOBBY -> WRITE, fige players_order, calcule
     total_rounds et deadline_ts.
 
-Étape 4 (cette version) :
+Étape 4 :
   - submissions : dict[round_n][pseudo] -> payload, mémorise toutes les
     soumissions du round courant.
   - add_submission(round_n, pseudo, payload) : enregistre.
@@ -38,8 +38,11 @@ les transitions à l'oral lors de la soutenance.
   - advance_round() : passe au round suivant ou termine la partie.
   - is_game_finished() : True après le dernier round.
 
-Étapes suivantes (préparées dans la structure mais pas implémentées) :
-  - 6 : phase REVEAL + retour au LOBBY.
+Étape 6 (cette version) :
+  - reveal_album_index, reveal_step, reveal_finished : position
+    courante du défilement REVEAL.
+  - to_reveal_payload() : sérialise pour le retained reveal/current.
+  - advance_reveal() : avance d'une étape dans le défilement.
 """
 from __future__ import annotations
 
@@ -94,6 +97,19 @@ class RoomController:
     # a besoin pour construire les albums lors de la consolidation.
     # Vidé au démarrage de chaque round dans advance_round().
     submissions: dict[int, dict[str, dict]] = field(default_factory=dict)
+
+    # ---- état du défilement REVEAL (étape 6) ----
+    # Position courante du défilement, en deux dimensions :
+    #   - reveal_album_index : index dans players_order, identifie quel
+    #     album est en cours de défilement (Akkk pour k = reveal_album_index).
+    #   - reveal_step : numéro de round dans cet album (0..total_rounds-1).
+    # Initialisés à 0 quand on entre en phase REVEAL, incrémentés par
+    # advance_reveal() à chaque tick du timer côté ServerApp.
+    # reveal_finished passe à True quand on a affiché la dernière étape
+    # du dernier album.
+    reveal_album_index: int = 0
+    reveal_step: int = 0
+    reveal_finished: bool = False
 
     # Mémoire de TOUS les pseudos qui ont publié au moins une fois
     # dans cette room (online ou offline). Sert au moment de la
@@ -409,11 +425,11 @@ class RoomController:
         return self.round_n >= self.total_rounds - 1
 
     def enter_reveal_phase(self) -> None:
-        """Transition vers la phase REVEAL (étape 6, simplifié ici).
+        """Transition vers la phase REVEAL.
 
-        À l'étape 4, on se contente de passer la phase à REVEAL et
-        d'effacer la deadline (pas de timer en REVEAL pour l'instant).
-        L'étape 6 implémentera le défilement des albums.
+        Étape 6 : on initialise les compteurs de défilement à (0, 0)
+        (album A0, step 0). C'est le ServerApp qui se charge d'armer
+        un timer pour appeler advance_reveal() périodiquement.
 
         Précondition : is_game_finished() doit être vrai.
         """
@@ -421,3 +437,76 @@ class RoomController:
             "enter_reveal_phase() appelée alors que la partie n'est pas finie"
         self.phase = Phase.REVEAL
         self.deadline_ts = 0
+        # Étape 6 : initialise la position du défilement.
+        self.reveal_album_index = 0
+        self.reveal_step = 0
+        self.reveal_finished = False
+
+    def to_reveal_payload(self) -> dict:
+        """Payload du retained rooms/<id>/reveal/current.
+
+        Format défini par shared/schemas.py:RevealPayload.
+        Construit à partir de la position courante du défilement.
+
+        - album_id : "A<reveal_album_index>".
+        - step : reveal_step (= round_n affiché).
+        - total_steps : total_rounds (combien d'étapes par album).
+        - finished : True uniquement après le dernier publish.
+        """
+        return {
+            "album_id": f"A{self.reveal_album_index}",
+            "step": self.reveal_step,
+            "total_steps": self.total_rounds,
+            "finished": self.reveal_finished,
+        }
+
+    def advance_reveal(self) -> None:
+        """Avance d'une étape dans le défilement REVEAL.
+
+        Logique :
+          1. Si on n'est pas à la fin du round courant pour cet album
+             (reveal_step < total_rounds - 1), on incrémente reveal_step.
+          2. Sinon, on passe à l'album suivant : reveal_album_index += 1
+             et reveal_step = 0.
+          3. Si on dépasse le dernier album (reveal_album_index >=
+             nb albums), on remet le pointeur à la dernière étape valide
+             du dernier album et on met reveal_finished = True. Le
+             pointeur "geler sur la fin" permet aux clients qui se
+             reconnectent en retained de voir la dernière entrée
+             affichable plutôt qu'un état incohérent.
+
+        Précondition : on est en phase REVEAL et reveal_finished est
+        encore False (sinon on ne devrait pas appeler advance_reveal).
+
+        Le ServerApp doit publier le payload résultant immédiatement
+        après l'appel.
+        """
+        assert self.phase == Phase.REVEAL, \
+            f"advance_reveal() en phase invalide : {self.phase}"
+        assert not self.reveal_finished, \
+            "advance_reveal() appelé alors que le défilement est déjà fini"
+
+        n_albums = len(self.players_order)
+        # Cas particulier : pas de joueurs (ne devrait pas arriver mais
+        # défensif). On marque comme fini pour éviter un timer infini.
+        if n_albums == 0 or self.total_rounds == 0:
+            self.reveal_finished = True
+            return
+
+        # 1) Avance dans l'album courant si possible.
+        if self.reveal_step < self.total_rounds - 1:
+            self.reveal_step += 1
+            return
+
+        # 2) On était à la dernière étape de l'album courant.
+        # Passe à l'album suivant.
+        next_album = self.reveal_album_index + 1
+        if next_album < n_albums:
+            self.reveal_album_index = next_album
+            self.reveal_step = 0
+            return
+
+        # 3) Dernier album, dernière étape déjà affichée : on termine.
+        # On garde le pointeur sur la dernière étape valide pour que
+        # le retained "finished" reste cohérent avec un contenu réel.
+        self.reveal_finished = True

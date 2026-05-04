@@ -48,7 +48,7 @@ class PresenceStatus(str, Enum):
 DURATION_WRITE_S = 45
 DURATION_DRAW_S = 90
 DURATION_GUESS_S = 45
-DURATION_REVEAL_STEP_S = 6   # Délai entre chaque étape de la révélation
+DURATION_REVEAL_STEP_S = 3   # Délai entre chaque étape de la révélation
 
 # Bornes de partie
 MIN_PLAYERS = 3
