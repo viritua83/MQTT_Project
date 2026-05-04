@@ -17,4 +17,11 @@ class ClientState:
 
         self.server_online = False
         self.available_rooms = []
+<<<<<<< Updated upstream
         
+=======
+
+        self.albums = {}
+
+        self.reveal_current = None
+>>>>>>> Stashed changes

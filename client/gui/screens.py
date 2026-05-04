@@ -1,8 +1,10 @@
+from random import random
 import tkinter as tk
 from tkinter import simpledialog
 import secrets
 import time
 from shared import topics
+from shared.protocol import FALLBACK_WORDS
 
 class MenuScreen(tk.Frame):
     def __init__(self, parent, app):
@@ -26,12 +28,16 @@ class MenuScreen(tk.Frame):
         self.rooms_list_inner.pack(fill="both", expand=True)
 
         self.create_btn = tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup)
+<<<<<<< Updated upstream
         self.create_btn.pack(pady=10)
 
         self.status_label = tk.Label(self, text="", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50")
         self.status_label.pack(pady=5)
 
         self.pending_room_id = None
+=======
+        self.create_btn.pack(pady=20)
+>>>>>>> Stashed changes
 
         self.update_server_status()
         self.update_rooms_list()
@@ -39,8 +45,12 @@ class MenuScreen(tk.Frame):
     def update_server_status(self):
         if self.app.state.server_online:
             self.server_status_label.config(text="🟢 Serveur en ligne", fg="#2ECC71")
+            self.create_btn.config(state=tk.NORMAL, bg="#2980B9")
         else:
             self.server_status_label.config(text="🔴 Serveur hors ligne", fg="#E74C3C")
+            self.create_btn.config(state=tk.DISABLED, bg="#7F8C8D")
+        
+        self.update_rooms_list()
 
     def update_rooms_list(self):
         for widget in self.rooms_list_inner.winfo_children():
@@ -59,8 +69,15 @@ class MenuScreen(tk.Frame):
                 state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
                 bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
 
+<<<<<<< Updated upstream
                 tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
                           command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
+=======
+            btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
+            
+            state = tk.NORMAL if (phase == "LOBBY" and self.app.state.server_online) else tk.DISABLED
+            bg_color = "#27AE60" if state == tk.NORMAL else "#7F8C8D"
+>>>>>>> Stashed changes
 
         if self.pending_room_id:
             if any(r.get("id") == self.pending_room_id for r in self.app.state.available_rooms):
@@ -105,7 +122,11 @@ class MenuScreen(tk.Frame):
             
         self.app.net.enter_room(room_id, pseudo)
         self.app.show_screen("LOBBY")
+<<<<<<< Updated upstream
 
+=======
+        
+>>>>>>> Stashed changes
 class LobbyScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -174,8 +195,15 @@ class LobbyScreen(tk.Frame):
     def update_players_list(self):
         text = "Joueur(s) en ligne :\n"
         for p in self.app.state.players:
+<<<<<<< Updated upstream
             status = "✅" if p in self.app.state.ready_players else "⏳"
             text += f"- {p} {status}\n"
+=======
+            if p in self.app.state.ready_players:
+                text += f"- {p} ✔\n"
+            else:
+                text += f"- {p} ⏳\n"
+>>>>>>> Stashed changes
         self.players_label.config(text=text)
 
         total = len(self.app.state.players)
@@ -311,11 +339,18 @@ class WriteScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
+<<<<<<< Updated upstream
         round_n = getattr(self.app.state, "round", 0)
         tk.Label(self, text=f"Phase d'Écriture - Round {round_n}", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
         
         self.timer_label = tk.Label(self, text="Temps restant : --", font=("Arial", 20, "bold"), fg="#E74C3C", bg="#2C3E50")
         self.timer_label.pack(pady=10)
+=======
+        tk.Label(self, text="Phase d'Écriture", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
+
+        self.timer_label = tk.Label(self, text="Temps restant : --", font=("Arial", 14, "bold"), fg="#E74C3C", bg="#2C3E50")
+        self.timer_label.pack(pady=5)
+>>>>>>> Stashed changes
 
         tk.Label(self, text="Invente une phrase drôle ou absurde :", font=("Arial", 16), fg="lightgray", bg="#2C3E50").pack(pady=10)
 
@@ -329,16 +364,25 @@ class WriteScreen(tk.Frame):
         self.status_label.pack(pady=10)
 
         self.submitted = False
+<<<<<<< Updated upstream
         self.update_timer()
 
     def update_timer(self):
         if not self.winfo_exists():
             return
             
+=======
+        self._update_timer()
+
+    def _update_timer(self):
+        if not self.winfo_exists():
+            return
+>>>>>>> Stashed changes
         rem = self.app.state.deadline_ts - int(time.time())
         if rem <= 0:
             self.timer_label.config(text="Temps écoulé !")
             if not self.submitted:
+<<<<<<< Updated upstream
                 self.submit_sentence()
         else:
             self.timer_label.config(text=f"Temps restant : {rem}s")
@@ -352,6 +396,25 @@ class WriteScreen(tk.Frame):
         content = self.sentence_entry.get().strip()
         if not content:
             content = "[Pas d'inspiration]"
+=======
+                self.submit_sentence(auto=True)
+        else:
+            self.timer_label.config(text=f"Temps restant : {rem}s")
+            self.after(1000, self._update_timer)
+
+    def submit_sentence(self, auto=False):
+        if self.submitted:
+            return
+
+        content = self.sentence_entry.get().strip()
+        if not content:
+            if auto:
+                content = random.choice(FALLBACK_WORDS)
+            else:
+                return
+
+        self.submitted = True
+>>>>>>> Stashed changes
 
         payload = {
             "type": "sentence",
@@ -420,5 +483,138 @@ class RevealScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
+        self.is_ending = False
         self.configure(bg="#2C3E50")
-        tk.Label(self, text="Phase REVEAL : L'album final", font=("Arial", 20), fg="white", bg="#2C3E50").pack(pady=50)
+
+        self.header_label = tk.Label(self, text="En attente de la révélation...", font=("Arial", 22, "bold"), fg="white", bg="#2C3E50")
+        self.header_label.pack(pady=15)
+
+        self.author_label = tk.Label(self, text="", font=("Arial", 16, "italic"), fg="#3498DB", bg="#2C3E50")
+        self.author_label.pack(pady=5)
+
+        self.left_warning = tk.Label(self, text="", font=("Arial", 14, "bold"), fg="#E67E22", bg="#2C3E50")
+        self.left_warning.pack()
+
+        self.content_frame = tk.Frame(self, bg="#34495E", bd=2, relief=tk.SUNKEN)
+        self.content_frame.pack(pady=20, padx=20, fill="both", expand=True)
+
+        self.text_label = tk.Label(self.content_frame, text="", font=("Arial", 24, "bold"), fg="white", bg="#34495E", wraplength=550, justify="center")
+        self.canvas = tk.Canvas(self.content_frame, bg="white", width=600, height=400)
+
+        self.end_label = tk.Label(self, text="", font=("Arial", 24, "bold"), fg="#2ECC71", bg="#2C3E50")
+        self.countdown_label = tk.Label(self, text="", font=("Arial", 16), fg="white", bg="#2C3E50")
+
+        # Le fix ultime : on laisse à Tkinter le temps de finir sa construction
+        self.after(50, self.on_reveal_received)
+
+    def on_reveal_received(self):
+        # Double sécurité absolue
+        if not hasattr(self, 'winfo_exists') or not self.winfo_exists():
+            return
+        if getattr(self, 'is_ending', False):
+            return
+
+        reveal_data = self.app.state.reveal_current
+        if not reveal_data:
+            return
+
+        if reveal_data.get("finished"):
+            self.trigger_end_sequence()
+            return
+
+        album_id = reveal_data.get("album_id")
+        step = reveal_data.get("step")
+        
+        if album_id is None or step is None:
+            return
+
+        total = getattr(self.app.state, 'total_rounds', 0)
+        self.header_label.config(text=f"Album de {str(album_id).upper()} — étape {step + 1}/{total}")
+
+        entry = self.app.state.albums.get(album_id, {}).get(step)
+        
+        if not entry:
+            self.author_label.config(text="(Données de l'album manquantes...)")
+            return
+
+        entry_type = entry.get("type")
+        contributor = entry.get("contributed_by", "???")
+
+        if entry.get("contributor_left"):
+            self.left_warning.config(text="⚠️ Joueur parti : généré automatiquement")
+        else:
+            self.left_warning.config(text="")
+
+        self.text_label.pack_forget()
+        self.canvas.pack_forget()
+
+        if entry_type == "sentence":
+            if step == 0:
+                self.author_label.config(text=f"Phrase de départ écrite par {contributor}")
+            else:
+                self.author_label.config(text=f"Déduit par {contributor}")
+            
+            self.text_label.config(text=f"« {entry.get('content', '')} »")
+            self.text_label.pack(expand=True)
+
+        elif entry_type == "drawing":
+            self.author_label.config(text=f"Dessiné par {contributor}")
+            self.render_drawing(entry)
+            self.canvas.pack(pady=10)
+
+    def render_drawing(self, entry):
+        self.canvas.delete("all")
+        strokes = entry.get("strokes", [])
+        canvas_size = entry.get("canvas_size", [600, 400])
+
+        src_w, src_h = canvas_size if len(canvas_size) >= 2 else (600, 400)
+        sx = 600 / src_w if src_w else 1.0
+        sy = 400 / src_h if src_h else 1.0
+
+        for stroke in strokes:
+            color = stroke.get("color", "black")
+            width = max(1, int(stroke.get("width", 3)))
+            points = stroke.get("points", [])
+            for i in range(len(points) - 1):
+                p1, p2 = points[i], points[i+1]
+                x1, y1 = p1[0] * sx, p1[1] * sy
+                x2, y2 = p2[0] * sx, p2[1] * sy
+                self.canvas.create_line(x1, y1, x2, y2, fill=color, width=width, capstyle=tk.ROUND)
+
+        if not strokes:
+            self.canvas.create_text(300, 200, text="(Page blanche)", font=("Arial", 14, "italic"), fill="gray")
+
+    def trigger_end_sequence(self):
+        self.is_ending = True
+        
+        self.header_label.pack_forget()
+        self.author_label.pack_forget()
+        self.left_warning.pack_forget()
+        self.content_frame.pack_forget()
+
+        self.end_label.config(text="Partie terminée ! 🎉")
+        self.end_label.pack(pady=40)
+        self.countdown_label.pack()
+
+        self.run_countdown(5)
+
+    def run_countdown(self, remaining):
+        if remaining > 0:
+            self.countdown_label.config(text=f"Retour au menu dans {remaining}...")
+            self.after(1000, self.run_countdown, remaining - 1)
+        else:
+            self.cleanup_and_quit()
+
+    def cleanup_and_quit(self):
+        room_id = self.app.state.room_id
+        pseudo = self.app.state.pseudo
+        ts = int(time.time())
+
+        topic_presence = topics.t_player_presence(room_id, pseudo)
+        self.app.net.client.publish_json(topic_presence, {"status": "offline", "pseudo": pseudo, "ts": ts}, retain=True)
+
+        topic_ready = topics.t_player_ready(room_id, pseudo)
+        self.app.net.client.publish_json(topic_ready, {"ready": False, "pseudo": pseudo, "ts": ts}, retain=True)
+
+        self.app.net.connect_menu()
+        self.app.show_screen("MENU")

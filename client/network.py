@@ -45,6 +45,7 @@ class NetworkManager:
         self.client.on_message_for(topics.sub_all_player_ready(room_id), self._on_player_ready)
         self.client.on_message_for(topics.sub_all_albums(room_id), self._on_album)
         self.client.on_message_for(topics.t_state(room_id), self._on_state)
+        self.client.on_message_for(topics.t_reveal_current(room_id), self._on_reveal)
 
         self.client.on_ready(self._publish_online)
         self.client.connect_and_loop()
@@ -119,3 +120,10 @@ class NetworkManager:
                      pass
                  else:
                      self.app.after(0, lambda: self.app.show_screen(self.state.phase))
+
+    def _on_reveal(self, topic, payload, retain):
+        if not payload:
+            return
+        self.state.reveal_current = payload 
+        if hasattr(self.app.current_screen, 'on_reveal_received'):
+            self.app.after(0, self.app.current_screen.on_reveal_received)

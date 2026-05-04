@@ -2,7 +2,7 @@ import tkinter as tk
 from client.network import NetworkManager
 from .screens import MenuScreen, LobbyScreen, DrawScreen, WriteScreen, GuessScreen, RevealScreen 
 
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 class GarticApp(tk.Tk):
     def __init__(self, state):
