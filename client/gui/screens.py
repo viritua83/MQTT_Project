@@ -1,4 +1,4 @@
-from random import random
+import random
 import tkinter as tk
 from tkinter import simpledialog
 import secrets
@@ -11,6 +11,9 @@ class MenuScreen(tk.Frame):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
+        
+        # Initialisation de la variable pour éviter le crash au démarrage
+        self.pending_room_id = None 
 
         tk.Label(self, text="Gartic MQTT", font=("Arial", 28, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
 
@@ -28,10 +31,12 @@ class MenuScreen(tk.Frame):
         self.rooms_list_inner.pack(fill="both", expand=True)
 
         self.create_btn = tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup)
-        self.create_btn.pack(pady=20)
+        self.create_btn.pack(pady=10)
+
+        self.status_label = tk.Label(self, text="", font=("Arial", 12), fg="#F1C40F", bg="#2C3E50")
+        self.status_label.pack(pady=5)
 
         self.update_server_status()
-        self.update_rooms_list()
 
     def update_server_status(self):
         if self.app.state.server_online:
@@ -56,14 +61,12 @@ class MenuScreen(tk.Frame):
                 n_players = room.get("n_players")
                 phase = room.get("phase")
 
-                btn_text = f"{name} ({n_players} joueur(s)) - [{phase}]"
-                state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
-                bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
+                btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
+                state = tk.NORMAL if (phase == "LOBBY" and self.app.state.server_online) else tk.DISABLED
+                bg_color = "#27AE60" if state == tk.NORMAL else "#7F8C8D"
 
-            btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
-            
-            state = tk.NORMAL if (phase == "LOBBY" and self.app.state.server_online) else tk.DISABLED
-            bg_color = "#27AE60" if state == tk.NORMAL else "#7F8C8D"
+                tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
+                          command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
 
         if self.pending_room_id:
             if any(r.get("id") == self.pending_room_id for r in self.app.state.available_rooms):
@@ -195,29 +198,11 @@ class LobbyScreen(tk.Frame):
 
 
 class DrawScreen(tk.Frame):
-    """Écran de dessin (rounds impairs).
-
-    Étape 5 :
-      - Calcule l'album assigné à ce joueur pour le round courant via
-        la rotation (cf shared/rotation.py).
-      - Lit l'album à l'index `round-1` (la phrase écrite par le joueur
-        précédent dans la chaîne) et l'affiche en haut du canvas.
-      - Affiche "Chargement..." si l'album n'est pas encore arrivé
-        (race condition possible quand on bascule juste après le
-        publish des albums par le serveur). Réessaie à la réception
-        d'un album via on_album_received().
-      - Compte à rebours basé sur state.deadline_ts.
-      - Auto-soumission à la deadline (avec ce que le joueur a dessiné,
-        même rien : strokes vides → le serveur prendra ça tel quel).
-      - Désactive le canvas après soumission.
-    """
-
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
 
-        # En-tête : titre + timer + phrase à dessiner.
         tk.Label(
             self, text=f"À toi de dessiner ! - Round {self.app.state.round}",
             font=("Arial", 18, "bold"), fg="white", bg="#2C3E50",
@@ -229,8 +214,6 @@ class DrawScreen(tk.Frame):
         )
         self.timer_label.pack(pady=2)
 
-        # Étape 5 : zone d'affichage de la phrase à dessiner.
-        # Le label est mis à jour par self._refresh_prompt().
         self.prompt_label = tk.Label(
             self, text="Chargement de la phrase...",
             font=("Arial", 16, "italic"), fg="#F1C40F", bg="#2C3E50",
@@ -238,14 +221,12 @@ class DrawScreen(tk.Frame):
         )
         self.prompt_label.pack(pady=8)
 
-        # Indicateur "joueur parti" affiché si contributor_left=True.
         self.left_warning = tk.Label(
             self, text="", font=("Arial", 11, "italic"),
             fg="#E67E22", bg="#2C3E50",
         )
         self.left_warning.pack(pady=0)
 
-        # Toolbar de dessin (identique à avant).
         self.toolbar = tk.Frame(self, bg="gray")
         self.toolbar.pack(side="top", fill="x", padx=20)
 
@@ -282,33 +263,18 @@ class DrawScreen(tk.Frame):
         self.app.bind("<Control-z>", lambda e: self.undo())
         self.app.bind("<Control-y>", lambda e: self.redo())
 
-        # Étape 5 : suivi de la soumission + timer.
         self.submitted = False
         self.status_label = tk.Label(self, text="", font=("Arial", 13, "italic"), fg="#F1C40F", bg="#2C3E50")
         self.status_label.pack(pady=2)
 
-        # Affichage initial du prompt + démarrage du timer.
         self._refresh_prompt()
         self._update_timer()
 
     def on_album_received(self):
-        """Notifié par network._on_album quand un album arrive.
-
-        Étape 5 : utilisé pour rafraîchir l'affichage si on était en
-        attente de l'album à dessiner (race condition à la transition).
-        """
         if self.winfo_exists():
             self._refresh_prompt()
 
     def _refresh_prompt(self):
-        """Met à jour le label avec la phrase à dessiner.
-
-        Lit dans state.albums l'album assigné à ce joueur, à l'index
-        round-1 (la phrase produite par le joueur précédent dans la
-        chaîne). Si l'album n'est pas encore arrivé, affiche un message
-        d'attente — on_album_received() relancera _refresh_prompt
-        à l'arrivée du retained.
-        """
         try:
             from shared.rotation import album_assigned_to_player
         except ImportError:
@@ -319,7 +285,6 @@ class DrawScreen(tk.Frame):
         players_order = self.app.state.players_order
         pseudo = self.app.state.pseudo
 
-        # Sécurité : au tout début ou si players_order pas encore reçu.
         if not players_order or pseudo not in players_order:
             self.prompt_label.config(text="Chargement de la partie...")
             return
@@ -327,8 +292,6 @@ class DrawScreen(tk.Frame):
         album_id = album_assigned_to_player(pseudo, round_n, players_order)
         prev_round = round_n - 1
 
-        # Lit l'album. Si pas encore là, attend (on_album_received
-        # relancera la méthode).
         album_for_round = self.app.state.albums.get(album_id, {})
         entry = album_for_round.get(prev_round)
         if entry is None:
@@ -344,8 +307,6 @@ class DrawScreen(tk.Frame):
             fg="#F1C40F",
         )
 
-        # Indicateur "le joueur précédent a quitté" si le placeholder
-        # serveur l'a marqué.
         if entry.get("contributor_left"):
             contributor = entry.get("contributed_by", "?")
             self.left_warning.config(
@@ -355,10 +316,6 @@ class DrawScreen(tk.Frame):
             self.left_warning.config(text="")
 
     def _update_timer(self):
-        """Compte à rebours basé sur state.deadline_ts.
-
-        À 0, déclenche l'auto-soumission. Boucle via after(1000).
-        """
         if not self.winfo_exists():
             return
         rem = self.app.state.deadline_ts - int(time.time())
@@ -371,11 +328,6 @@ class DrawScreen(tk.Frame):
             self.after(1000, self._update_timer)
 
     def submit_drawing(self):
-        """Publie la soumission dessin sur le bon topic.
-
-        Idempotent via self.submitted : le bouton et l'auto-soumission
-        peuvent appeler la méthode plusieurs fois sans risque.
-        """
         if self.submitted:
             return
         self.submitted = True
@@ -394,9 +346,6 @@ class DrawScreen(tk.Frame):
         if self.app.net.client:
             self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
 
-        # Désactive les bindings du canvas pour empêcher les modifs
-        # post-soumission (UX : évite que le joueur continue à dessiner
-        # alors que sa soumission est partie).
         self.canvas.unbind("<Button-1>")
         self.canvas.unbind("<B1-Motion>")
         self.canvas.unbind("<ButtonRelease-1>")
@@ -454,6 +403,7 @@ class DrawScreen(tk.Frame):
                 x1, y1 = points[i]
                 x2, y2 = points[i+1]
                 self.canvas.create_line(x1, y1, x2, y2, fill=color, width=width, capstyle=tk.ROUND)
+
 
 class WriteScreen(tk.Frame):
     def __init__(self, parent, app):
@@ -522,21 +472,8 @@ class WriteScreen(tk.Frame):
         self.submit_btn.config(state="disabled")
         self.status_label.config(text="Phrase envoyée ! En attente des autres...")
 
+
 class GuessScreen(tk.Frame):
-    """Écran de devinette (rounds pairs >= 2).
-
-    Étape 5 :
-      - Calcule l'album assigné à ce joueur via la rotation.
-      - Lit l'album à l'index `round-1` (le dessin produit par le joueur
-        précédent dans la chaîne) et le redessine sur un canvas en
-        lecture seule via canvas.create_line.
-      - Affiche "Chargement..." si l'album n'est pas encore arrivé,
-        on_album_received() relance le rendu.
-      - Champ texte pour la devinette + bouton envoyer.
-      - Compte à rebours basé sur deadline_ts.
-      - Auto-soumission à la deadline (avec fallback texte si vide).
-    """
-
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
@@ -553,18 +490,14 @@ class GuessScreen(tk.Frame):
         )
         self.timer_label.pack(pady=2)
 
-        # Canvas en lecture seule pour afficher le dessin reçu.
         self.canvas = tk.Canvas(self, bg="white", width=600, height=400)
         self.canvas.pack(pady=10)
 
-        # Texte affiché tant que le dessin n'est pas arrivé. On le retire
-        # via canvas.delete("placeholder") une fois rendu.
         self.canvas.create_text(
             300, 200, text="⏳ Chargement du dessin...",
             font=("Arial", 14), fill="gray", tags="placeholder",
         )
 
-        # Indicateur "joueur parti" pour le contributeur précédent.
         self.left_warning = tk.Label(
             self, text="", font=("Arial", 11, "italic"),
             fg="#E67E22", bg="#2C3E50",
@@ -592,27 +525,14 @@ class GuessScreen(tk.Frame):
         self.submitted = False
         self.drawing_rendered = False
 
-        # Tente d'afficher le dessin (s'il est déjà arrivé) puis démarre
-        # le timer.
         self._refresh_drawing()
         self._update_timer()
 
     def on_album_received(self):
-        """Notifié par network._on_album quand un album arrive.
-
-        Étape 5 : si on attendait le dessin du round précédent, on le
-        rend maintenant.
-        """
         if self.winfo_exists() and not self.drawing_rendered:
             self._refresh_drawing()
 
     def _refresh_drawing(self):
-        """Affiche le dessin du round précédent.
-
-        Lit l'album assigné à ce joueur, à l'index round-1. Si pas
-        encore arrivé, garde le placeholder et attend on_album_received.
-        Si arrivé, redessine les strokes sur le canvas en lecture seule.
-        """
         try:
             from shared.rotation import album_assigned_to_player
         except ImportError:
@@ -633,25 +553,17 @@ class GuessScreen(tk.Frame):
 
         print(f"[DBG _refresh_prompt] album_id calculé={album_id} prev_round={prev_round}")
         print(f"[DBG _refresh_prompt] state.albums.get({album_id})={self.app.state.albums.get(album_id)}")
-   
-
+    
         album_for_round = self.app.state.albums.get(album_id, {})
         entry = album_for_round.get(prev_round)
         if entry is None:
-            # Pas encore arrivé, on attend on_album_received.
             return
 
-        # On efface le placeholder "Chargement..." et on dessine.
         self.canvas.delete("placeholder")
 
         strokes = entry.get("strokes", [])
         canvas_size = entry.get("canvas_size", [600, 400])
-        # Mise à l'échelle : le dessin a pu être fait à une taille
-        # différente du canvas d'affichage. On scale linéairement.
-        # Ici la canvas_size source devrait être [600, 400] (cf
-        # DrawScreen.submit_drawing) et notre canvas affichage est
-        # aussi 600x400 → scale de 1.0. On garde le calcul pour
-        # robustesse au cas où on changerait les tailles plus tard.
+
         src_w, src_h = canvas_size if len(canvas_size) >= 2 else (600, 400)
         dst_w, dst_h = 600, 400
         sx = dst_w / src_w if src_w else 1.0
@@ -663,8 +575,6 @@ class GuessScreen(tk.Frame):
             points = stroke.get("points", [])
             for i in range(len(points) - 1):
                 p1, p2 = points[i], points[i+1]
-                # Les points peuvent être [x, y] (liste) ou (x, y) (tuple).
-                # On gère les deux formes.
                 x1, y1 = p1[0] * sx, p1[1] * sy
                 x2, y2 = p2[0] * sx, p2[1] * sy
                 self.canvas.create_line(
@@ -672,16 +582,12 @@ class GuessScreen(tk.Frame):
                     fill=color, width=width, capstyle=tk.ROUND,
                 )
 
-        # Cas particulier : dessin vide (placeholder serveur ou joueur
-        # qui n'a rien dessiné). On affiche un message dédié pour que
-        # le joueur ne croie pas à un bug.
         if not strokes:
             self.canvas.create_text(
                 300, 200, text="(dessin vide)",
                 font=("Arial", 12, "italic"), fill="lightgray",
             )
 
-        # Indicateur "joueur parti".
         if entry.get("contributor_left"):
             contributor = entry.get("contributed_by", "?")
             self.left_warning.config(
@@ -705,13 +611,6 @@ class GuessScreen(tk.Frame):
             self.after(1000, self._update_timer)
 
     def submit_guess(self, auto=False):
-        """Publie la devinette sur le bon topic.
-
-        Idempotent via self.submitted. En auto-submit (deadline), on
-        accepte un champ vide et on met un placeholder texte (le
-        serveur préfère un payload qu'une absence : ça évite que le
-        serveur génère son propre fallback).
-        """
         if self.submitted:
             return
 
@@ -720,7 +619,6 @@ class GuessScreen(tk.Frame):
             if auto:
                 content = "[Pas d'idée]"
             else:
-                # Clic manuel sur "Envoyer" sans rien : on ignore (UX).
                 return
 
         self.submitted = True
@@ -741,6 +639,7 @@ class GuessScreen(tk.Frame):
         self.guess_entry.config(state="disabled")
         self.submit_btn.config(state="disabled")
         self.status_label.config(text="Réponse envoyée ! En attente des autres...")
+
 
 class RevealScreen(tk.Frame):
     def __init__(self, parent, app):
@@ -767,11 +666,9 @@ class RevealScreen(tk.Frame):
         self.end_label = tk.Label(self, text="", font=("Arial", 24, "bold"), fg="#2ECC71", bg="#2C3E50")
         self.countdown_label = tk.Label(self, text="", font=("Arial", 16), fg="white", bg="#2C3E50")
 
-        # Le fix ultime : on laisse à Tkinter le temps de finir sa construction
         self.after(50, self.on_reveal_received)
 
     def on_reveal_received(self):
-        # Double sécurité absolue
         if not hasattr(self, 'winfo_exists') or not self.winfo_exists():
             return
         if getattr(self, 'is_ending', False):

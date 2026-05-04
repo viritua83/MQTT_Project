@@ -23,3 +23,5 @@ class ClientState:
         # Lu par DrawScreen et GuessScreen pour afficher la phrase à dessiner
         # ou le dessin à deviner.
         self.albums = {}
+
+        self.reveal_current = None
