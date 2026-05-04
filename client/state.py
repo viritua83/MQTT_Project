@@ -6,6 +6,7 @@ class ClientState:
         self.room_id = ""
         self.is_ready = False
         self.players = []
+        self.ready_players = []
         
         self.phase = Phase.LOBBY.value
         self.round = 0
@@ -16,3 +17,9 @@ class ClientState:
 
         self.server_online = False
         self.available_rooms = []
+
+        # Étape 4+ : albums reçus du serveur, structure {album_id: {round_n: payload}}.
+        # Alimenté par network._on_album à chaque retained albums/<id>/round/<n>.
+        # Lu par DrawScreen et GuessScreen pour afficher la phrase à dessiner
+        # ou le dessin à deviner.
+        self.albums = {}

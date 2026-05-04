@@ -128,8 +128,15 @@ def t_album(room_id: str, album_id: str, round_n: int) -> str:
 
 
 def sub_all_albums(room_id: str) -> str:
-    """Wildcard pour suivre tous les albums (utile en phase reveal et reconnexion)."""
-    return f"{PREFIX}/rooms/{room_id}/albums/+/+"
+    """Wildcard pour suivre tous les albums (utile en phase reveal et reconnexion).
+
+    Matche tous les topics albums/<album_id>/round/<round_n>.
+    Note importante : en MQTT, le wildcard `+` ne matche QU'UN SEUL segment.
+    Le topic réel a la forme `albums/A0/round/0` (3 segments après albums),
+    donc le wildcard doit avoir EXACTEMENT la même structure avec `+` aux
+    bons emplacements et le mot "round" au milieu en littéral.
+    """
+    return f"{PREFIX}/rooms/{room_id}/albums/+/round/+"
 
 
 def t_reveal_current(room_id: str) -> str:

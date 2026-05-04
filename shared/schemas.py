@@ -114,16 +114,22 @@ class DrawingSubmissionPayload(TypedDict):
 # Publié par le serveur après consolidation d'un round.
 # ---------------------------------------------------------------------------
 
-class AlbumSentenceEntry(TypedDict):
+class AlbumSentenceEntry(TypedDict, total=False):
+    # Champs obligatoires
     album_id: str
     round: int
     type: Literal["sentence"]
     content: str
     contributed_by: str       # Qui a produit cette entrée
     original_author: str      # Qui a démarré cet album au round 0
+    # Champs optionnels (étape 5)
+    contributor_left: bool    # True si le contributeur a quitté la partie
+                              # (placeholder serveur). Permet à la GUI
+                              # d'afficher un indicateur "joueur parti".
 
 
-class AlbumDrawingEntry(TypedDict):
+class AlbumDrawingEntry(TypedDict, total=False):
+    # Champs obligatoires
     album_id: str
     round: int
     type: Literal["drawing"]
@@ -131,6 +137,8 @@ class AlbumDrawingEntry(TypedDict):
     canvas_size: List[int]
     contributed_by: str
     original_author: str
+    # Champs optionnels (étape 5)
+    contributor_left: bool
 
 
 # ---------------------------------------------------------------------------

@@ -120,20 +120,64 @@ class LobbyScreen(tk.Frame):
         self.players_label.config(text=text)
 
 class DrawScreen(tk.Frame):
+    """Écran de dessin (rounds impairs).
+
+    Étape 5 :
+      - Calcule l'album assigné à ce joueur pour le round courant via
+        la rotation (cf shared/rotation.py).
+      - Lit l'album à l'index `round-1` (la phrase écrite par le joueur
+        précédent dans la chaîne) et l'affiche en haut du canvas.
+      - Affiche "Chargement..." si l'album n'est pas encore arrivé
+        (race condition possible quand on bascule juste après le
+        publish des albums par le serveur). Réessaie à la réception
+        d'un album via on_album_received().
+      - Compte à rebours basé sur state.deadline_ts.
+      - Auto-soumission à la deadline (avec ce que le joueur a dessiné,
+        même rien : strokes vides → le serveur prendra ça tel quel).
+      - Désactive le canvas après soumission.
+    """
+
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="À toi de dessiner !", font=("Arial", 18, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
+        # En-tête : titre + timer + phrase à dessiner.
+        tk.Label(
+            self, text=f"À toi de dessiner ! - Round {self.app.state.round}",
+            font=("Arial", 18, "bold"), fg="white", bg="#2C3E50",
+        ).pack(pady=5)
 
+        self.timer_label = tk.Label(
+            self, text="Temps restant : --",
+            font=("Arial", 14, "bold"), fg="#E74C3C", bg="#2C3E50",
+        )
+        self.timer_label.pack(pady=2)
+
+        # Étape 5 : zone d'affichage de la phrase à dessiner.
+        # Le label est mis à jour par self._refresh_prompt().
+        self.prompt_label = tk.Label(
+            self, text="Chargement de la phrase...",
+            font=("Arial", 16, "italic"), fg="#F1C40F", bg="#2C3E50",
+            wraplength=600, justify="center",
+        )
+        self.prompt_label.pack(pady=8)
+
+        # Indicateur "joueur parti" affiché si contributor_left=True.
+        self.left_warning = tk.Label(
+            self, text="", font=("Arial", 11, "italic"),
+            fg="#E67E22", bg="#2C3E50",
+        )
+        self.left_warning.pack(pady=0)
+
+        # Toolbar de dessin (identique à avant).
         self.toolbar = tk.Frame(self, bg="gray")
         self.toolbar.pack(side="top", fill="x", padx=20)
 
         self.current_color = "black"
         self.current_width = 3
         self.colors = ["black", "red", "green", "blue", "yellow", "orange", "purple", "white"]
-        
+
         tk.Button(self.toolbar, text="Envoyer le dessin ✔", bg="#27AE60", fg="white", font=("Arial", 10, "bold"), command=self.submit_drawing).pack(side="right", padx=10)
         tk.Button(self.toolbar, text="Effacer", command=self.clear_canvas).pack(side="right", padx=5)
         tk.Button(self.toolbar, text="Redo ↪", command=self.redo).pack(side="right", padx=2)
@@ -159,35 +203,136 @@ class DrawScreen(tk.Frame):
         self.canvas.bind("<Button-1>", self.start_draw)
         self.canvas.bind("<B1-Motion>", self.draw)
         self.canvas.bind("<ButtonRelease-1>", self.stop_draw)
-        
+
         self.app.bind("<Control-z>", lambda e: self.undo())
         self.app.bind("<Control-y>", lambda e: self.redo())
 
+        # Étape 5 : suivi de la soumission + timer.
+        self.submitted = False
+        self.status_label = tk.Label(self, text="", font=("Arial", 13, "italic"), fg="#F1C40F", bg="#2C3E50")
+        self.status_label.pack(pady=2)
+
+        # Affichage initial du prompt + démarrage du timer.
+        self._refresh_prompt()
+        self._update_timer()
+
+    def on_album_received(self):
+        """Notifié par network._on_album quand un album arrive.
+
+        Étape 5 : utilisé pour rafraîchir l'affichage si on était en
+        attente de l'album à dessiner (race condition à la transition).
+        """
+        if self.winfo_exists():
+            self._refresh_prompt()
+
+    def _refresh_prompt(self):
+        """Met à jour le label avec la phrase à dessiner.
+
+        Lit dans state.albums l'album assigné à ce joueur, à l'index
+        round-1 (la phrase produite par le joueur précédent dans la
+        chaîne). Si l'album n'est pas encore arrivé, affiche un message
+        d'attente — on_album_received() relancera _refresh_prompt
+        à l'arrivée du retained.
+        """
+        try:
+            from shared.rotation import album_assigned_to_player
+        except ImportError:
+            self.prompt_label.config(text="Erreur : module rotation introuvable")
+            return
+
+        round_n = self.app.state.round
+        players_order = self.app.state.players_order
+        pseudo = self.app.state.pseudo
+
+        # Sécurité : au tout début ou si players_order pas encore reçu.
+        if not players_order or pseudo not in players_order:
+            self.prompt_label.config(text="Chargement de la partie...")
+            return
+
+        album_id = album_assigned_to_player(pseudo, round_n, players_order)
+        prev_round = round_n - 1
+
+        # Lit l'album. Si pas encore là, attend (on_album_received
+        # relancera la méthode).
+        album_for_round = self.app.state.albums.get(album_id, {})
+        entry = album_for_round.get(prev_round)
+        if entry is None:
+            self.prompt_label.config(
+                text=f"⏳ Chargement de l'album {album_id}...",
+                fg="#F39C12",
+            )
+            return
+
+        content = entry.get("content", "(phrase manquante)")
+        self.prompt_label.config(
+            text=f"« {content} »",
+            fg="#F1C40F",
+        )
+
+        # Indicateur "le joueur précédent a quitté" si le placeholder
+        # serveur l'a marqué.
+        if entry.get("contributor_left"):
+            contributor = entry.get("contributed_by", "?")
+            self.left_warning.config(
+                text=f"⚠️ {contributor} a quitté la partie : phrase générée automatiquement",
+            )
+        else:
+            self.left_warning.config(text="")
+
+    def _update_timer(self):
+        """Compte à rebours basé sur state.deadline_ts.
+
+        À 0, déclenche l'auto-soumission. Boucle via after(1000).
+        """
+        if not self.winfo_exists():
+            return
+        rem = self.app.state.deadline_ts - int(time.time())
+        if rem <= 0:
+            self.timer_label.config(text="Temps écoulé !")
+            if not self.submitted:
+                self.submit_drawing()
+        else:
+            self.timer_label.config(text=f"Temps restant : {rem}s")
+            self.after(1000, self._update_timer)
+
     def submit_drawing(self):
+        """Publie la soumission dessin sur le bon topic.
+
+        Idempotent via self.submitted : le bouton et l'auto-soumission
+        peuvent appeler la méthode plusieurs fois sans risque.
+        """
+        if self.submitted:
+            return
+        self.submitted = True
+
         payload = {
             "type": "drawing",
-            "round": getattr(self.app.state, "round", 1),
+            "round": self.app.state.round,
             "author": self.app.state.pseudo,
             "strokes": self.all_strokes,
             "canvas_size": [600, 400],
-            "ts": int(time.time())
+            "ts": int(time.time()),
         }
-        
+
         topic = topics.t_submission(self.app.state.room_id, payload["round"], self.app.state.pseudo)
-        
-        self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
-        
+
+        if self.app.net.client:
+            self.app.net.client.publish_json(topic, payload, qos=1, retain=True)
+
+        # Désactive les bindings du canvas pour empêcher les modifs
+        # post-soumission (UX : évite que le joueur continue à dessiner
+        # alors que sa soumission est partie).
         self.canvas.unbind("<Button-1>")
         self.canvas.unbind("<B1-Motion>")
         self.canvas.unbind("<ButtonRelease-1>")
-        tk.Label(self, text="Dessin envoyé ! En attente des autres...", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50").pack(pady=5)
+        self.status_label.config(text="Dessin envoyé ! En attente des autres...")
 
-    def set_color(self, color): 
+    def set_color(self, color):
         self.current_color = color
 
     def set_width(self, width):
         self.current_width = width
-    
+
     def clear_canvas(self):
         self.canvas.delete("all")
         self.all_strokes = []
@@ -207,10 +352,10 @@ class DrawScreen(tk.Frame):
         stroke_data = {
             "color": self.current_color,
             "width": self.current_width,
-            "points": self.current_stroke_points
+            "points": self.current_stroke_points,
         }
         self.all_strokes.append(stroke_data)
-        self.redo_stack = [] 
+        self.redo_stack = []
         self.last_x, self.last_y = None, None
 
     def undo(self):
@@ -276,40 +421,214 @@ class WriteScreen(tk.Frame):
         self.status_label.config(text="Phrase envoyée ! En attente des autres...")
 
 class GuessScreen(tk.Frame):
+    """Écran de devinette (rounds pairs >= 2).
+
+    Étape 5 :
+      - Calcule l'album assigné à ce joueur via la rotation.
+      - Lit l'album à l'index `round-1` (le dessin produit par le joueur
+        précédent dans la chaîne) et le redessine sur un canvas en
+        lecture seule via canvas.create_line.
+      - Affiche "Chargement..." si l'album n'est pas encore arrivé,
+        on_album_received() relance le rendu.
+      - Champ texte pour la devinette + bouton envoyer.
+      - Compte à rebours basé sur deadline_ts.
+      - Auto-soumission à la deadline (avec fallback texte si vide).
+    """
+
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
         self.configure(bg="#2C3E50")
 
-        tk.Label(self, text="Que représente ce dessin ?", font=("Arial", 20, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
+        tk.Label(
+            self, text=f"Que représente ce dessin ? - Round {self.app.state.round}",
+            font=("Arial", 18, "bold"), fg="white", bg="#2C3E50",
+        ).pack(pady=5)
 
-        self.canvas = tk.Canvas(self, bg="white", width=600, height=300)
+        self.timer_label = tk.Label(
+            self, text="Temps restant : --",
+            font=("Arial", 14, "bold"), fg="#E74C3C", bg="#2C3E50",
+        )
+        self.timer_label.pack(pady=2)
+
+        # Canvas en lecture seule pour afficher le dessin reçu.
+        self.canvas = tk.Canvas(self, bg="white", width=600, height=400)
         self.canvas.pack(pady=10)
-        
-        self.canvas.create_text(300, 150, text="[Le dessin d'un autre joueur s'affichera ici]", font=("Arial", 14), fill="gray")
 
-        tk.Label(self, text="Ta déduction :", font=("Arial", 14), fg="lightgray", bg="#2C3E50").pack(pady=5)
-        
+        # Texte affiché tant que le dessin n'est pas arrivé. On le retire
+        # via canvas.delete("placeholder") une fois rendu.
+        self.canvas.create_text(
+            300, 200, text="⏳ Chargement du dessin...",
+            font=("Arial", 14), fill="gray", tags="placeholder",
+        )
+
+        # Indicateur "joueur parti" pour le contributeur précédent.
+        self.left_warning = tk.Label(
+            self, text="", font=("Arial", 11, "italic"),
+            fg="#E67E22", bg="#2C3E50",
+        )
+        self.left_warning.pack(pady=0)
+
+        tk.Label(
+            self, text="Ta déduction :",
+            font=("Arial", 14), fg="lightgray", bg="#2C3E50",
+        ).pack(pady=5)
+
         self.guess_entry = tk.Entry(self, font=("Arial", 16), width=40, justify="center")
-        self.guess_entry.pack(pady=10)
+        self.guess_entry.pack(pady=5)
 
-        self.submit_btn = tk.Button(self, text="Envoyer la réponse ✔", font=("Arial", 14, "bold"), bg="#27AE60", fg="white", command=self.submit_guess)
+        self.submit_btn = tk.Button(
+            self, text="Envoyer la réponse ✔",
+            font=("Arial", 14, "bold"), bg="#27AE60", fg="white",
+            command=self.submit_guess,
+        )
         self.submit_btn.pack(pady=10)
 
-        self.status_label = tk.Label(self, text="", font=("Arial", 14), fg="#F1C40F", bg="#2C3E50")
-        self.status_label.pack(pady=5)
+        self.status_label = tk.Label(self, text="", font=("Arial", 13, "italic"), fg="#F1C40F", bg="#2C3E50")
+        self.status_label.pack(pady=2)
 
-    def submit_guess(self):
+        self.submitted = False
+        self.drawing_rendered = False
+
+        # Tente d'afficher le dessin (s'il est déjà arrivé) puis démarre
+        # le timer.
+        self._refresh_drawing()
+        self._update_timer()
+
+    def on_album_received(self):
+        """Notifié par network._on_album quand un album arrive.
+
+        Étape 5 : si on attendait le dessin du round précédent, on le
+        rend maintenant.
+        """
+        if self.winfo_exists() and not self.drawing_rendered:
+            self._refresh_drawing()
+
+    def _refresh_drawing(self):
+        """Affiche le dessin du round précédent.
+
+        Lit l'album assigné à ce joueur, à l'index round-1. Si pas
+        encore arrivé, garde le placeholder et attend on_album_received.
+        Si arrivé, redessine les strokes sur le canvas en lecture seule.
+        """
+        try:
+            from shared.rotation import album_assigned_to_player
+        except ImportError:
+            return
+
+        round_n = self.app.state.round
+        players_order = self.app.state.players_order
+        pseudo = self.app.state.pseudo
+
+        print(f"[DBG _refresh_prompt] pseudo={pseudo} round={round_n} order={players_order}")
+        print(f"[DBG _refresh_prompt] state.albums={self.app.state.albums}")
+
+        if not players_order or pseudo not in players_order:
+            return
+
+        album_id = album_assigned_to_player(pseudo, round_n, players_order)
+        prev_round = round_n - 1
+
+        print(f"[DBG _refresh_prompt] album_id calculé={album_id} prev_round={prev_round}")
+        print(f"[DBG _refresh_prompt] state.albums.get({album_id})={self.app.state.albums.get(album_id)}")
+   
+
+        album_for_round = self.app.state.albums.get(album_id, {})
+        entry = album_for_round.get(prev_round)
+        if entry is None:
+            # Pas encore arrivé, on attend on_album_received.
+            return
+
+        # On efface le placeholder "Chargement..." et on dessine.
+        self.canvas.delete("placeholder")
+
+        strokes = entry.get("strokes", [])
+        canvas_size = entry.get("canvas_size", [600, 400])
+        # Mise à l'échelle : le dessin a pu être fait à une taille
+        # différente du canvas d'affichage. On scale linéairement.
+        # Ici la canvas_size source devrait être [600, 400] (cf
+        # DrawScreen.submit_drawing) et notre canvas affichage est
+        # aussi 600x400 → scale de 1.0. On garde le calcul pour
+        # robustesse au cas où on changerait les tailles plus tard.
+        src_w, src_h = canvas_size if len(canvas_size) >= 2 else (600, 400)
+        dst_w, dst_h = 600, 400
+        sx = dst_w / src_w if src_w else 1.0
+        sy = dst_h / src_h if src_h else 1.0
+
+        for stroke in strokes:
+            color = stroke.get("color", "black")
+            width = max(1, int(stroke.get("width", 3)))
+            points = stroke.get("points", [])
+            for i in range(len(points) - 1):
+                p1, p2 = points[i], points[i+1]
+                # Les points peuvent être [x, y] (liste) ou (x, y) (tuple).
+                # On gère les deux formes.
+                x1, y1 = p1[0] * sx, p1[1] * sy
+                x2, y2 = p2[0] * sx, p2[1] * sy
+                self.canvas.create_line(
+                    x1, y1, x2, y2,
+                    fill=color, width=width, capstyle=tk.ROUND,
+                )
+
+        # Cas particulier : dessin vide (placeholder serveur ou joueur
+        # qui n'a rien dessiné). On affiche un message dédié pour que
+        # le joueur ne croie pas à un bug.
+        if not strokes:
+            self.canvas.create_text(
+                300, 200, text="(dessin vide)",
+                font=("Arial", 12, "italic"), fill="lightgray",
+            )
+
+        # Indicateur "joueur parti".
+        if entry.get("contributor_left"):
+            contributor = entry.get("contributed_by", "?")
+            self.left_warning.config(
+                text=f"⚠️ {contributor} a quitté la partie : dessin généré automatiquement",
+            )
+        else:
+            self.left_warning.config(text="")
+
+        self.drawing_rendered = True
+
+    def _update_timer(self):
+        if not self.winfo_exists():
+            return
+        rem = self.app.state.deadline_ts - int(time.time())
+        if rem <= 0:
+            self.timer_label.config(text="Temps écoulé !")
+            if not self.submitted:
+                self.submit_guess(auto=True)
+        else:
+            self.timer_label.config(text=f"Temps restant : {rem}s")
+            self.after(1000, self._update_timer)
+
+    def submit_guess(self, auto=False):
+        """Publie la devinette sur le bon topic.
+
+        Idempotent via self.submitted. En auto-submit (deadline), on
+        accepte un champ vide et on met un placeholder texte (le
+        serveur préfère un payload qu'une absence : ça évite que le
+        serveur génère son propre fallback).
+        """
+        if self.submitted:
+            return
+
         content = self.guess_entry.get().strip()
         if not content:
-            return
+            if auto:
+                content = "[Pas d'idée]"
+            else:
+                # Clic manuel sur "Envoyer" sans rien : on ignore (UX).
+                return
+
+        self.submitted = True
 
         payload = {
             "type": "sentence",
-            "round": getattr(self.app.state, "round", 2),
+            "round": self.app.state.round,
             "author": self.app.state.pseudo,
             "ts": int(time.time()),
-            "content": content
+            "content": content,
         }
 
         topic = topics.t_submission(self.app.state.room_id, payload["round"], self.app.state.pseudo)

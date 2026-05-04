@@ -1140,7 +1140,17 @@ class ServerApp:
                 room_id, round_n, len(missing), missing,
             )
             for pseudo in missing:
-                placeholder = self._make_placeholder_payload(round_n, pseudo)
+                # Étape 5 : distingue "joueur parti" (plus dans online)
+                # vs "joueur a juste raté la deadline".
+                # Un joueur qui n'est plus online_players a quitté la
+                # room (ou crashé sans LWT encore propagée). Dans les
+                # deux cas, pour la GUI c'est équivalent : on affiche
+                # "joueur parti" pour signaler qu'il ne reviendra pas
+                # contribuer à cet album.
+                has_left = pseudo not in room.online_players
+                placeholder = self._make_placeholder_payload(
+                    round_n, pseudo, has_left=has_left,
+                )
                 room.add_submission(round_n, pseudo, placeholder)
                 # On publie aussi le placeholder en retained sur le topic
                 # de soumission. Comme ça si un client se reconnecte
@@ -1251,6 +1261,12 @@ class ServerApp:
                 "contributed_by": pseudo,
                 "original_author": original_author,
             }
+            # Étape 5 : si le contributeur était parti et qu'on a généré
+            # un placeholder, on remonte l'info dans l'entrée d'album.
+            # La GUI s'en sert pour afficher un indicateur "joueur parti"
+            # à côté du contenu.
+            if submission.get("left"):
+                entry["contributor_left"] = True
             if sub_type == SubmissionType.SENTENCE.value:
                 entry["content"] = submission.get("content", "")
             elif sub_type == SubmissionType.DRAWING.value:
@@ -1274,15 +1290,25 @@ class ServerApp:
                 room.room_id, album_id, round_n, pseudo, original_author, sub_type,
             )
 
-    def _make_placeholder_payload(self, round_n: int, pseudo: str) -> dict:
+    def _make_placeholder_payload(
+        self,
+        round_n: int,
+        pseudo: str,
+        has_left: bool = False,
+    ) -> dict:
         """Construit une soumission de remplacement pour un joueur absent.
 
         Type de placeholder selon la phase :
-          - round pair (WRITE/GUESS) : sentence avec un mot piochés
+          - round pair (WRITE/GUESS) : sentence avec un mot pioché
             au hasard dans FALLBACK_WORDS (cf shared/protocol.py).
           - round impair (DRAW) : drawing avec strokes vides.
             Le client affichera un dessin vide, c'est volontaire (ça
             indique visuellement qu'un joueur n'a pas fait de dessin).
+
+        Étape 5 : on ajoute un champ "left" pour signaler que le joueur
+        a quitté la partie (et pas juste laissé passer la deadline). Ce
+        champ sera repris dans l'album entry sous le nom "contributor_left",
+        permettant à la GUI d'afficher un indicateur "joueur parti".
 
         ts est mis à 0 pour signaler "non publié par le joueur".
         author est mis au pseudo du joueur absent (pour traçabilité).
@@ -1292,7 +1318,7 @@ class ServerApp:
             # On pioche un mot au hasard pour rester dans l'esprit
             # Gartic (placeholders absurdes plutôt qu'un message d'erreur).
             content = random.choice(FALLBACK_WORDS)
-            return {
+            payload = {
                 "type": SubmissionType.SENTENCE.value,
                 "round": round_n,
                 "author": pseudo,
@@ -1300,7 +1326,7 @@ class ServerApp:
                 "content": content,
             }
         else:
-            return {
+            payload = {
                 "type": SubmissionType.DRAWING.value,
                 "round": round_n,
                 "author": pseudo,
@@ -1308,6 +1334,14 @@ class ServerApp:
                 "strokes": [],
                 "canvas_size": [600, 400],
             }
+
+        # Champ optionnel "left" : True si le joueur a quitté la partie.
+        # Permet à la GUI de distinguer "joueur a laissé passer la deadline"
+        # vs "joueur a quitté", et d'afficher un indicateur approprié.
+        if has_left:
+            payload["left"] = True
+
+        return payload
 
     # ------------------------------------------------------------------
     # Helpers
