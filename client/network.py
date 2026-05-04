@@ -45,6 +45,7 @@ class NetworkManager:
         self.client.on_message_for(topics.sub_all_player_ready(room_id), self._on_player_ready)
         self.client.on_message_for(topics.sub_all_albums(room_id), self._on_album)
         self.client.on_message_for(topics.t_state(room_id), self._on_state)
+        self.client.on_message_for(topics.t_reveal_current(room_id), self._on_reveal)
 
         self.client.on_ready(self._publish_online)
         self.client.connect_and_loop()
