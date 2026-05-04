@@ -28,16 +28,7 @@ class MenuScreen(tk.Frame):
         self.rooms_list_inner.pack(fill="both", expand=True)
 
         self.create_btn = tk.Button(self, text="Créer une room", font=("Arial", 14, "bold"), bg="#2980B9", fg="white", command=self.create_room_popup)
-<<<<<<< Updated upstream
-        self.create_btn.pack(pady=10)
-
-        self.status_label = tk.Label(self, text="", font=("Arial", 12, "italic"), fg="#F1C40F", bg="#2C3E50")
-        self.status_label.pack(pady=5)
-
-        self.pending_room_id = None
-=======
         self.create_btn.pack(pady=20)
->>>>>>> Stashed changes
 
         self.update_server_status()
         self.update_rooms_list()
@@ -69,15 +60,10 @@ class MenuScreen(tk.Frame):
                 state = tk.NORMAL if phase == "LOBBY" else tk.DISABLED
                 bg_color = "#27AE60" if phase == "LOBBY" else "#7F8C8D"
 
-<<<<<<< Updated upstream
-                tk.Button(self.rooms_list_inner, text=btn_text, font=("Arial", 12, "bold"), bg=bg_color, fg="white", state=state, 
-                          command=lambda r=room_id: self.join_specific_room(r)).pack(fill="x", pady=5, padx=20)
-=======
             btn_text = f"{name} ({n_players} joueurs) - [{phase}]"
             
             state = tk.NORMAL if (phase == "LOBBY" and self.app.state.server_online) else tk.DISABLED
             bg_color = "#27AE60" if state == tk.NORMAL else "#7F8C8D"
->>>>>>> Stashed changes
 
         if self.pending_room_id:
             if any(r.get("id") == self.pending_room_id for r in self.app.state.available_rooms):
@@ -122,11 +108,7 @@ class MenuScreen(tk.Frame):
             
         self.app.net.enter_room(room_id, pseudo)
         self.app.show_screen("LOBBY")
-<<<<<<< Updated upstream
-
-=======
         
->>>>>>> Stashed changes
 class LobbyScreen(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -195,15 +177,10 @@ class LobbyScreen(tk.Frame):
     def update_players_list(self):
         text = "Joueur(s) en ligne :\n"
         for p in self.app.state.players:
-<<<<<<< Updated upstream
-            status = "✅" if p in self.app.state.ready_players else "⏳"
-            text += f"- {p} {status}\n"
-=======
             if p in self.app.state.ready_players:
                 text += f"- {p} ✔\n"
             else:
                 text += f"- {p} ⏳\n"
->>>>>>> Stashed changes
         self.players_label.config(text=text)
 
         total = len(self.app.state.players)
@@ -339,18 +316,10 @@ class WriteScreen(tk.Frame):
         self.app = app
         self.configure(bg="#2C3E50")
 
-<<<<<<< Updated upstream
-        round_n = getattr(self.app.state, "round", 0)
-        tk.Label(self, text=f"Phase d'Écriture - Round {round_n}", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=20)
-        
-        self.timer_label = tk.Label(self, text="Temps restant : --", font=("Arial", 20, "bold"), fg="#E74C3C", bg="#2C3E50")
-        self.timer_label.pack(pady=10)
-=======
         tk.Label(self, text="Phase d'Écriture", font=("Arial", 24, "bold"), fg="white", bg="#2C3E50").pack(pady=10)
 
         self.timer_label = tk.Label(self, text="Temps restant : --", font=("Arial", 14, "bold"), fg="#E74C3C", bg="#2C3E50")
         self.timer_label.pack(pady=5)
->>>>>>> Stashed changes
 
         tk.Label(self, text="Invente une phrase drôle ou absurde :", font=("Arial", 16), fg="lightgray", bg="#2C3E50").pack(pady=10)
 
@@ -364,39 +333,15 @@ class WriteScreen(tk.Frame):
         self.status_label.pack(pady=10)
 
         self.submitted = False
-<<<<<<< Updated upstream
-        self.update_timer()
-
-    def update_timer(self):
-        if not self.winfo_exists():
-            return
-            
-=======
         self._update_timer()
 
     def _update_timer(self):
         if not self.winfo_exists():
             return
->>>>>>> Stashed changes
         rem = self.app.state.deadline_ts - int(time.time())
         if rem <= 0:
             self.timer_label.config(text="Temps écoulé !")
             if not self.submitted:
-<<<<<<< Updated upstream
-                self.submit_sentence()
-        else:
-            self.timer_label.config(text=f"Temps restant : {rem}s")
-            self.after(1000, self.update_timer)
-
-    def submit_sentence(self):
-        if self.submitted:
-            return
-            
-        self.submitted = True
-        content = self.sentence_entry.get().strip()
-        if not content:
-            content = "[Pas d'inspiration]"
-=======
                 self.submit_sentence(auto=True)
         else:
             self.timer_label.config(text=f"Temps restant : {rem}s")
@@ -414,7 +359,6 @@ class WriteScreen(tk.Frame):
                 return
 
         self.submitted = True
->>>>>>> Stashed changes
 
         payload = {
             "type": "sentence",
